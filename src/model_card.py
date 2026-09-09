@@ -21,6 +21,7 @@ import http.server
 import json
 import os
 import re
+import struct
 import socketserver
 import threading
 import time
@@ -56,7 +57,7 @@ ALLOWED_ORIGINS = {
     "http://localhost:8110", "http://127.0.0.1:8110",
 }
 
-VERSION = "2.5.0"
+VERSION = "2.7.0"
 
 GATE_PORT = int(os.environ.get("NC_GATE_PORT", "8111"))
 GATE_ENABLED = os.environ.get("NC_GATE", "1") not in ("0", "false", "no")
@@ -127,7 +128,8 @@ def _get_pending():
 
 # ------------------------------------------------- llama-swap config parsing
 
-_cfg_cache = {"mtime": 0.0, "paths": {}, "groups": {}, "exclusive": set()}
+_cfg_cache = {"mtime": 0.0, "paths": {}, "mmproj": {}, "ctx": {},
+              "kv_type": {}, "groups": {}, "exclusive": set()}
 
 
 def parse_swap_config():
@@ -145,6 +147,7 @@ def parse_swap_config():
         return _cfg_cache
 
     paths, groups, exclusive = {}, {}, set()
+    mmproj, ctx, kv_type = {}, {}, {}
     section = None          # 'models' | 'groups'
     cur_model = None
     cur_group = None
@@ -173,6 +176,18 @@ def parse_swap_config():
                         p = re.search(r"-m\s+(\S+\.gguf)", line)
                         if p:
                             paths[cur_model] = p.group(1)
+                        # A multimodal projector is mapped alongside the
+                        # weights and is 0.4-2.5 GiB. Counting only -m is how
+                        # every vision model came out under-sized.
+                        p = re.search(r"--mmproj\s+(\S+\.gguf)", line)
+                        if p:
+                            mmproj[cur_model] = p.group(1)
+                        p = re.search(r"(?:^|\s)(?:-c|--ctx-size)\s+(\d+)", line)
+                        if p:
+                            ctx[cur_model] = int(p.group(1))
+                        p = re.search(r"(?:^|\s)(?:-ctk|--cache-type-k)\s+(\S+)", line)
+                        if p:
+                            kv_type[cur_model] = p.group(1)
 
                 elif section == "groups":
                     m = re.match(r"^  ([A-Za-z0-9._-]+):\s*$", line)
@@ -196,12 +211,14 @@ def parse_swap_config():
         print("swap config parse failed: %s" % e, flush=True)
         return _cfg_cache
 
-    _cfg_cache.update({"mtime": st.st_mtime, "paths": paths,
+    _cfg_cache.update({"mtime": st.st_mtime, "paths": paths, "mmproj": mmproj,
+                       "ctx": ctx, "kv_type": kv_type,
                        "groups": groups, "exclusive": exclusive})
     return _cfg_cache
 
 
 def model_size_bytes(model_id):
+    """Bytes of the weights file alone. See model_footprint() for the total."""
     path = parse_swap_config()["paths"].get(model_id)
     if not path:
         return None
@@ -209,6 +226,138 @@ def model_size_bytes(model_id):
         return os.stat(path).st_size
     except OSError:
         return None
+
+
+def mmproj_size_bytes(model_id):
+    path = parse_swap_config()["mmproj"].get(model_id)
+    if not path:
+        return 0
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return 0
+
+
+# GGUF value types, from the spec. Only what the header needs.
+_G_U8, _G_I8, _G_U16, _G_I16, _G_U32, _G_I32, _G_F32, _G_BOOL, \
+    _G_STR, _G_ARR, _G_U64, _G_I64, _G_F64 = range(13)
+
+_gguf_cache = {}          # path -> (mtime, {key: value})
+
+_KV_ELEM_BYTES = {"f32": 4, "f16": 2, "bf16": 2, "q8_0": 1,
+                  "q5_1": 0.75, "q5_0": 0.6875, "q4_1": 0.625, "q4_0": 0.5625}
+
+
+def gguf_header(path):
+    """Read the GGUF key-value header. Stdlib only, cached on mtime.
+
+    Deliberately reads the header and stops: the tensor data is hundreds of
+    times larger and none of it is needed here.
+    """
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        return {}
+    hit = _gguf_cache.get(path)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    want = ("block_count", "head_count", "head_count_kv",
+            "key_length", "value_length", "embedding_length")
+    out = {}
+    try:
+        with open(path, "rb") as fh:
+            if fh.read(4) != b"GGUF":
+                return {}
+            struct.unpack("<I", fh.read(4))                       # version
+            struct.unpack("<Q", fh.read(8))                       # n_tensors
+            n_kv = struct.unpack("<Q", fh.read(8))[0]
+
+            def num(fmt, n):
+                return struct.unpack("<" + fmt, fh.read(n))[0]
+
+            def string():
+                return fh.read(num("Q", 8)).decode("utf-8", "replace")
+
+            def value(t):
+                if t == _G_STR:
+                    return string()
+                if t == _G_ARR:
+                    et = num("I", 4)
+                    return [value(et) for _ in range(num("Q", 8))]
+                fmt = {_G_U8: ("B", 1), _G_I8: ("b", 1), _G_U16: ("H", 2),
+                       _G_I16: ("h", 2), _G_U32: ("I", 4), _G_I32: ("i", 4),
+                       _G_F32: ("f", 4), _G_BOOL: ("B", 1), _G_U64: ("Q", 8),
+                       _G_I64: ("q", 8), _G_F64: ("d", 8)}.get(t)
+                if not fmt:
+                    raise ValueError("gguf type %d" % t)
+                v = num(*fmt)
+                return bool(v) if t == _G_BOOL else v
+
+            for _ in range(n_kv):
+                k = string()
+                v = value(num("I", 4))
+                if any(k.endswith(w) for w in want):
+                    out[k.split(".")[-1] if k.count(".") < 2
+                        else ".".join(k.split(".")[1:])] = v
+    except Exception:
+        return {}
+    _gguf_cache[path] = (mtime, out)
+    return out
+
+
+def kv_cache_bytes(model_id):
+    """Estimated KV cache for this model at its configured context.
+
+    Hybrid models (Nemotron-H, Qwen3-Next) publish attention.head_count_kv as
+    a per-block ARRAY with 0 for the Mamba/linear layers. Summing it is what
+    keeps the estimate from charging attention memory for layers that have
+    none -- treating block_count as the layer count overestimates those models
+    several-fold.
+
+    Assumes one unified cache of n_ctx (what llama-server reports as
+    kv_unified) and f16 elements unless -ctk says otherwise. Returns 0 rather
+    than a guess when the header does not say.
+    """
+    cfg = parse_swap_config()
+    path = cfg["paths"].get(model_id)
+    n_ctx = cfg["ctx"].get(model_id)
+    if not path or not n_ctx:
+        return 0
+    h = gguf_header(path)
+    if not h:
+        return 0
+    kvh = h.get("attention.head_count_kv", h.get("attention.head_count"))
+    blocks = h.get("block_count")
+    if kvh is None or not blocks:
+        return 0
+    total_kv_heads = sum(kvh) if isinstance(kvh, list) else kvh * blocks
+
+    k_dim = h.get("attention.key_length")
+    v_dim = h.get("attention.value_length")
+    if not k_dim or not v_dim:
+        # Fall back to the dense convention: head_dim = n_embd / n_head.
+        n_embd, n_head = h.get("embedding_length"), h.get("attention.head_count")
+        if not n_embd or not n_head:
+            return 0
+        k_dim = v_dim = n_embd // n_head
+
+    elem = _KV_ELEM_BYTES.get((cfg["kv_type"].get(model_id) or "f16").lower(), 2)
+    return int(n_ctx * total_kv_heads * (k_dim + v_dim) * elem)
+
+
+def model_footprint(model_id):
+    """(total, breakdown) of what loading this model actually costs.
+
+    weights + multimodal projector + KV cache at the configured context. Still
+    excludes the compute graph and the vision encoder's scratch buffers, which
+    is why a margin exists on top.
+    """
+    weights = model_size_bytes(model_id)
+    if weights is None:
+        return None, {}
+    proj = mmproj_size_bytes(model_id)
+    kv = kv_cache_bytes(model_id)
+    return weights + proj + kv, {"weights": weights, "mmproj": proj, "kv": kv}
 
 
 def group_of(model_id):
@@ -498,7 +647,7 @@ def evaluate_load(model_id, running_ids):
     st = get_state()
     held = st["hold"]
 
-    size = model_size_bytes(model_id)
+    size, parts = model_footprint(model_id)
     mem = mem_info()
     if size is None or mem["available"] is None:
         if held:
@@ -511,15 +660,24 @@ def evaluate_load(model_id, running_ids):
         members = set(parse_swap_config()["groups"].get(grp, []))
         for rid in running_ids:
             if rid != model_id and rid in members:
-                reclaimed += model_size_bytes(rid) or 0
+                reclaimed += (model_footprint(rid)[0] or 0)
 
     margin = int(st["margin_gib"] * GIB)
     effective = mem["available"] + reclaimed
     needed = size + margin
 
     fits = effective >= needed
-    short = ("needs %.1f GiB (model %.1f + %.1f margin), %.1f GiB would be free"
-             % (needed / GIB, size / GIB, margin / GIB, effective / GIB))
+    # Name the parts. "model 4.4" was the old text and it was the reason a
+    # vision model looked affordable when it was not: the projector and the KV
+    # cache are real allocations and were invisible.
+    bits = ["weights %.1f" % (parts["weights"] / GIB)]
+    if parts.get("mmproj"):
+        bits.append("projector %.1f" % (parts["mmproj"] / GIB))
+    if parts.get("kv"):
+        bits.append("KV %.1f" % (parts["kv"] / GIB))
+    bits.append("%.1f margin" % (margin / GIB))
+    short = ("needs %.1f GiB (%s), %.1f GiB would be free"
+             % (needed / GIB, " + ".join(bits), effective / GIB))
 
     # Name what is holding the memory. A refusal without this is true and
     # useless: the next question is always "taken by what?".
@@ -719,8 +877,9 @@ def build_status():
         grp_members = set(parse_swap_config()["groups"].get(grp, [])) if grp else set()
         evicts = [r for r in running_ids
                   if r != mid and r in grp_members and grp and is_exclusive(grp)]
-        reclaim = sum(model_size_bytes(r) or 0 for r in evicts)
-        needed = (size + int(st["margin_gib"] * GIB)) if size else None
+        reclaim = sum(model_footprint(r)[0] or 0 for r in evicts)
+        footprint, parts = model_footprint(mid)
+        needed = (footprint + int(st["margin_gib"] * GIB)) if footprint else None
         effective = (mem["available"] + reclaim) if mem["available"] is not None else None
         entries.append({
             "needed_gib": round(needed / GIB, 1) if needed else None,
@@ -731,7 +890,13 @@ def build_status():
             "state": state,
             "group": grp,
             "exclusive": bool(grp and is_exclusive(grp)),
+            # size_gib keeps its old meaning -- the weights file -- so nothing
+            # downstream silently changes units. The parts are additive and new.
             "size_gib": round(size / GIB, 1) if size else None,
+            "mmproj_gib": round(parts["mmproj"] / GIB, 2) if parts.get("mmproj") else None,
+            "kv_gib": round(parts["kv"] / GIB, 2) if parts.get("kv") else None,
+            "footprint_gib": round(footprint / GIB, 1) if footprint else None,
+            "ctx": parse_swap_config()["ctx"].get(mid),
             "proxy": (run or {}).get("proxy"),
             "ttl": (run or {}).get("ttl"),
             "tools": (known_tools.get(mid) or {}).get("tools"),

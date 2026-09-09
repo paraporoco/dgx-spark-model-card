@@ -115,6 +115,21 @@
     return Math.floor(s / 3600) + " h ago";
   }
 
+  // What loading this model actually costs: weights + projector + KV cache.
+  // size_gib alone is the weights file, which is what made vision models look
+  // affordable when they were not.
+  function footprint(m) {
+    if (!m) return null;
+    return (m.footprint_gib !== undefined && m.footprint_gib !== null)
+      ? m.footprint_gib : m.size_gib;
+  }
+  // Bytes actually read from disk, for the load-time estimate. The KV cache is
+  // allocated, not read, so it does not belong in a transfer-rate figure.
+  function diskGib(m) {
+    if (!m) return null;
+    return (m.size_gib || 0) + (m.mmproj_gib || 0);
+  }
+
   function eta(gib) {
     if (!gib || gib < 20) return null;
     return "≈ " + Math.max(1, Math.round(gib / GIB_PER_MIN)) + " min if not cached";
@@ -185,7 +200,7 @@
                 ])
               ]) : null,
               el("span", { class: LBL, style: "color:" + MUTED + ";" }, [
-                (m.size_gib ? m.size_gib + " GiB" : "") +
+                (footprint(m) ? footprint(m) + " GiB" : "") +
                 (m.group ? " · " + m.group : "") +
                 (m.ttl ? " · unloads after " + (m.ttl / 60) + " min idle" : "") +
                 (m.proxy ? " · " + m.proxy : "")
@@ -303,7 +318,7 @@
       return el("option", {
         value: m.id,
         selected: m.id === st.selected ? "selected" : null
-      }, [m.name + " — " + (m.size_gib || "?") + " GiB" + tools + " — " + fit]);
+      }, [m.name + " — " + (footprint(m) || "?") + " GiB" + tools + " — " + fit]);
     });
 
     var select = el("select", {
@@ -335,7 +350,7 @@
       if (b.indexOf("hold") !== -1) parts.push("Automatic loading is blocked.");
       if (b.indexOf("headroom") !== -1) {
         parts.push("Not enough memory: " + sel.name + " needs " + sel.needed_gib +
-                   " GiB free (" + sel.size_gib + " model + " + st.margin_gib +
+                   " GiB free (" + footprint(sel) + " model + " + st.margin_gib +
                    " reserve), " + sel.effective_gib + " GiB available.");
         var big = ((st.memory || {}).holders || []).filter(function (h) { return !h.ours; })[0];
         if (big) parts.push("Largest holder: " + big.name + " (pid " + big.pid + ") — " + big.gib + " GiB.");
@@ -344,10 +359,10 @@
       plan = parts.join(" ");
       planColor = b.indexOf("headroom") !== -1 ? ERR : WARN;
     } else {
-      var e = eta(sel.size_gib);
+      var e = eta(diskGib(sel));
       plan = "Start will " +
              (sel.evicts && sel.evicts.length ? "unload " + sel.evicts.join(", ") + " and load " : "load ") +
-             sel.name + " (" + sel.size_gib + " GiB" + (e ? ", " + e : "") + ").";
+             sel.name + " (" + footprint(sel) + " GiB" + (e ? ", " + e : "") + ").";
       planColor = OK;
     }
 
