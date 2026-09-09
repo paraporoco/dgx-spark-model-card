@@ -50,6 +50,10 @@ More importantly, on a **unified-memory** machine the models and everything else
 - **Last asked for by a client** — read from the gate's own traffic, so you can see what your editor is about to load.
 - **Memory attribution** — names the processes holding GPU memory, and marks how much of it is held *outside* llama-swap where the guard cannot reclaim it.
 - **Event log** — loads with real durations, evictions, refusals with reason and requester, hold changes; recorded even when another client caused them.
+- **Load progress** — a real bar with `loaded / total GiB` and an ETA from the observed rate, read from the upstream process because llama-swap reports nothing between launch and the health check passing.
+- **Tool-capability badge** — each model's chat template is probed on first load and badged `tools ✓` / `tools ✗`. A template check, not a behavioural one.
+- **Keep warm** — refreshes one model's TTL before it expires and reloads it if evicted, without ever overriding Blocked or the memory reserve.
+- **Wider layout** — the stock 1140 px shell is widened to `min(96vw, 1800px)` by an injected stylesheet that `destroy()` removes. Set `WIDEN_DASHBOARD = false` in `card.js` to opt out.
 
 ## The compatibility rule
 
@@ -173,6 +177,7 @@ State (`selected`, `hold`, `margin_gib`) persists in `$STATE_DIRECTORY/state.jso
 | `POST /api/margin` | `{gib}` |
 | `GET /api/logs?n=` | llama-swap log tail, own polling filtered out |
 | `GET /api/events?n=` | event log: loads, unloads, refusals, hold changes |
+| `POST /api/warm` | `{model, enabled}` — keep one model warm |
 | `GET /healthz` | liveness |
 
 CORS is allow-listed to the dashboard origins; a foreign origin gets no `Access-Control-Allow-Origin` header at all.

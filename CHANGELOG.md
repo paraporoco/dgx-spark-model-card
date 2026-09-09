@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.5.0 — 2026-09-09
+- **Keep warm.** A per-model toggle that refreshes the model's TTL before it expires, and reloads it if it has been evicted — so the cost of a cold load is paid on a schedule instead of on your next prompt. At most one model at a time, because llama-swap's `large` group is exclusive and two warm large models would evict each other in a loop.
+  - It obeys the same rules as everything else: **Blocked** stops a reload but not a ping (pinging a resident model allocates nothing), and the memory reserve applies to a reload exactly as to any other load. Verified live — blocked with `reason=hold` while loading was Blocked, then `keepwarm_reload` → ready once allowed.
+- **Wider dashboard.** The stock shell is capped at 1140 px; the card now widens it to `min(96vw, 1800px)` through a single injected stylesheet, removed again by `destroy()`. No NVIDIA file is touched, and turning the userscript off restores the stock layout exactly. Set `WIDEN_DASHBOARD = false` at the top of `card.js` to leave it alone.
+  - Targeted with an attribute selector — `[class~="max-w-[1140px]"]` — rather than a class selector, because the bracketed Tailwind class needs CSS identifier escaping that is easy to get wrong through two layers of quoting. Measured at 1920 px: container 1140 → 1800 px, beating Tailwind's own rule.
+- **Two-column body when there is room.** Memory and *Load a model* sit side by side on a wide screen and stack on a narrow one, using `flex-wrap` with a `320px` basis — no media query, no measuring, no layout code.
+- `tools/check-identifiers.js`: resolves bare upper-case identifiers. `node --check` passes a file that references an undefined constant, and when that throws inside a promise chain it surfaces as something unrelated.
+
+
 ## 2.4.0 — 2026-09-09
 - **Real load progress.** llama-swap reports nothing between launching an upstream and its health check passing, so progress is read from the upstream `llama-server` process itself — GPU allocation where available, resident memory as the early fallback — against the GGUF's own size. Shown as a bar with `loaded / total GiB` and an ETA derived from the *observed* rate on this machine, not a baked-in constant. Verified live: 48.8 % at t+5 s, 99.9 % at t+10 s, ready at t+15 s.
 - **Tool-capability badge.** On first load of a model its chat template is fetched from `/props` and tested for `tools` / `tool_calls`, then cached in state. Models are badged `tools ✓` / `tools ✗` in the dropdown and beside the loaded model. This makes visible a failure that is otherwise silent: a GGUF can carry a template with no tool block and answer in prose instead of calling tools, even with `tool_choice="required"`.

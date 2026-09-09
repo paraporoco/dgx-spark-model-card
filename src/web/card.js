@@ -1,4 +1,4 @@
-/* dgx-model-card v2.4 — "Local models" card for the NVIDIA DGX Dashboard.
+/* dgx-model-card v2.5 — "Local models" card for the NVIDIA DGX Dashboard.
  *
  * Touches no NVIDIA file. Mounts one node into the card grid; removed with
  * window.__dgxModelCard.destroy().
@@ -20,6 +20,34 @@
   })();
 
   var MOUNT_ID = "dgx-model-card-root";
+  var STYLE_ID = "dgx-model-card-style";
+
+  // Set to false to leave the dashboard's own 1140px shell alone.
+  var WIDEN_DASHBOARD = true;
+
+  // One stylesheet, injected once, removed by destroy(). It widens NVIDIA's
+  // container at runtime -- no NVIDIA file is modified, and turning the script
+  // off restores the stock layout exactly.
+  function injectStyle() {
+    if (document.getElementById(STYLE_ID)) return;
+    var css = "";
+    if (WIDEN_DASHBOARD) {
+      // Attribute selector, not a class selector: the dashboard's container class
+      // is `max-w-[1140px]`, whose brackets need CSS identifier escaping that is
+      // easy to get wrong through two layers of quoting. An attribute value is a
+      // plain string and needs none.
+      css += '[class~="max-w-[1140px]"]{max-width:min(96vw,1800px)!important;}';
+    }
+    // The card's two middle blocks sit side by side when there is room and
+    // stack when there is not. No media query, no measuring, no layout code:
+    // flex-wrap with a sane basis does the whole job.
+    css += '#' + MOUNT_ID + ' .dmc-split{display:flex;flex-wrap:wrap;gap:20px 28px;}';
+    css += '#' + MOUNT_ID + ' .dmc-split > *{flex:1 1 320px;min-width:0;}';
+    var el2 = document.createElement("style");
+    el2.id = STYLE_ID;
+    el2.textContent = css;
+    (document.head || document.documentElement).appendChild(el2);
+  }
   var POLL_IDLE = 6000, POLL_BUSY = 2500;
   var timer = null, observer = null, logsOpen = false, busy = false;
   var lastStatus = null, notice = null;
@@ -323,10 +351,35 @@
       planColor = OK;
     }
 
+    // Keep-warm defends against the idle TTL: the cost of a cold load is paid
+    // on a schedule instead of on the next prompt.
+    var warmOn = st.warm === st.selected;
+    var warmBox = el("label", {
+      style: "display:flex;align-items:center;gap:8px;cursor:pointer;",
+      title: "Refreshes this model's TTL before it expires, and reloads it if it " +
+             "gets evicted. Never overrides Blocked or the memory reserve."
+    }, [
+      el("input", {
+        type: "checkbox",
+        checked: warmOn ? "checked" : null,
+        style: "accent-color:#76b900;width:15px;height:15px;cursor:pointer;",
+        onchange: function (ev) {
+          var on = ev.target.checked;
+          busy = true; refresh();
+          post("/api/warm", { model: st.selected, enabled: on })
+            .catch(function () {}).then(function () { busy = false; tick(); });
+        }
+      }),
+      el("span", { class: LBL }, ["Keep warm"]),
+      el("span", { class: LBL, style: DIM },
+         [st.warm && st.warm !== st.selected ? "(currently: " + st.warm + ")" : ""])
+    ]);
+
     return el("div", { style: "display:flex;flex-direction:column;gap:8px;" }, [
       heading("Load a model"),
       select,
-      el("div", { class: LBL, style: "color:" + planColor + ";word-break:break-word;" }, [plan])
+      el("div", { class: LBL, style: "color:" + planColor + ";word-break:break-word;" }, [plan]),
+      warmBox
     ]);
   }
 
@@ -375,6 +428,7 @@
   // ---------------------------------------------------------------- render
 
   function render(st) {
+    injectStyle();
     var sel = (st.models || []).filter(function (m) { return m.id === st.selected; })[0] || null;
     var res = st.resident || [];
     var anyStarting = res.some(function (r) { return r.state === "starting"; });
@@ -404,7 +458,7 @@
       id: MOUNT_ID,
       class: "nv-panel nv-panel--elevation-low flex-1 min-w-full md:min-w-[520px]",
       style: "display:flex;flex-direction:column;gap:20px;padding:24px;border-radius:8px;" +
-             "flex:1 1 0%;min-width:min(100%,520px);"
+             "flex:1 1 560px;min-width:min(100%,520px);"
     }, [
       el("div", { class: "nv-panel-header",
                   style: "display:flex;align-items:center;justify-content:space-between;gap:16px;" }, [
@@ -422,9 +476,7 @@
       el("div", { style: "display:flex;flex-direction:column;gap:20px;flex:1 1 auto;" }, [
         loadedNow(st),
         el("div", { style: "height:1px;background:" + LINE + ";" }),
-        memoryBlock(st, sel),
-        el("div", { style: "height:1px;background:" + LINE + ";" }),
-        loadBlock(st, sel),
+        el("div", { class: "dmc-split" }, [memoryBlock(st, sel), loadBlock(st, sel)]),
         el("div", { style: "height:1px;background:" + LINE + ";" }),
         autoLoadBlock(st),
 
@@ -569,6 +621,8 @@
       if (observer) observer.disconnect();
       var n = document.getElementById(MOUNT_ID);
       if (n && n.parentElement) n.parentElement.removeChild(n);
+      var stl = document.getElementById(STYLE_ID);
+      if (stl && stl.parentElement) stl.parentElement.removeChild(stl);
       delete window.__dgxModelCard;
     }
   };

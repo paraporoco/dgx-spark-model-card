@@ -56,7 +56,7 @@ ALLOWED_ORIGINS = {
     "http://localhost:8110", "http://127.0.0.1:8110",
 }
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 
 GATE_PORT = int(os.environ.get("NC_GATE_PORT", "8111"))
 GATE_ENABLED = os.environ.get("NC_GATE", "1") not in ("0", "false", "no")
@@ -72,8 +72,10 @@ STARTED_AT = time.time()
 
 _lock = threading.Lock()
 _pending = {"action": None, "model": None, "since": 0.0, "error": None}
+# warm: at most ONE model. llama-swap's large group is exclusive, so keeping two
+# large models warm would just make them evict each other in a loop.
 _state = {"selected": DEFAULT_MODEL, "hold": False, "margin_gib": DEFAULT_MARGIN_GIB,
-          "tools": {}}
+          "tools": {}, "warm": None}
 
 
 def load_state():
@@ -81,7 +83,7 @@ def load_state():
         with open(STATE_PATH) as fh:
             data = json.load(fh)
         with _lock:
-            for k in ("selected", "hold", "margin_gib", "tools"):
+            for k in ("selected", "hold", "margin_gib", "tools", "warm"):
                 if k in data:
                     _state[k] = data[k]
     except Exception:
@@ -579,6 +581,64 @@ def _unload_worker():
         _set_pending(None, error="%s: %s" % (type(e).__name__, e))
 
 
+def _keep_warm():
+    """Refresh a model's TTL before it expires, and bring it back if it is gone.
+
+    Two rules it must not break:
+      * Hold means no NEW loads. Pinging a model that is already resident
+        allocates nothing, so that continues; reloading an evicted one does not.
+      * The headroom guard applies to a reload exactly as it does to any other
+        load. Keep-warm must never be the thing that OOMs the box.
+    """
+    last_ping = {}
+    while True:
+        time.sleep(20)
+        try:
+            target = get_state().get("warm")
+            if not target:
+                continue
+            try:
+                _, r = swap_json("/running", timeout=6)
+                running = {x.get("model"): x for x in r.get("running", [])}
+            except Exception:
+                continue
+
+            entry = running.get(target)
+            if entry and (entry.get("state") == "ready"):
+                ttl = entry.get("ttl") or 0
+                if ttl <= 0:
+                    continue                      # no expiry to defend against
+                due = max(30, ttl - 120)
+                if time.time() - last_ping.get(target, 0) < due:
+                    continue
+                try:
+                    swap_get("/upstream/%s/health" % target, timeout=30)
+                    last_ping[target] = time.time()
+                    log_event("keepwarm_ping", model=target, ttl=ttl)
+                except Exception as e:  # noqa: BLE001
+                    log_event("keepwarm_ping_failed", model=target, error=str(e)[:80])
+                continue
+
+            if entry:
+                continue                          # mid-load; leave it alone
+
+            # Not resident. Reload only if the same rules that govern any other
+            # load allow it.
+            ok, reason, detail = evaluate_load(target, list(running))
+            if not ok:
+                if time.time() - last_ping.get("_blocked:" + target, 0) > 600:
+                    last_ping["_blocked:" + target] = time.time()
+                    log_event("keepwarm_blocked", model=target, reason=reason,
+                              detail=detail or None)
+                continue
+            log_event("keepwarm_reload", model=target)
+            _set_pending("start", target)
+            threading.Thread(target=_load_worker, args=(target,), daemon=True).start()
+            last_ping[target] = time.time()
+        except Exception as e:  # noqa: BLE001
+            print("keep-warm loop error: %s" % e, flush=True)
+
+
 def _watch_resident():
     """Diff llama-swap's resident set so loads, evictions and unloads are recorded
     even when another client caused them."""
@@ -711,6 +771,7 @@ def build_status():
             for r in running
         ],
         "hold": st["hold"],
+        "warm": st.get("warm"),
         "margin_gib": st["margin_gib"],
         "config_seen": bool(cfg["paths"]),
         "pending": pending["action"],
@@ -850,6 +911,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             set_state(hold=enabled)
             log_event("hold", enabled=enabled)
             return self._json(200, {"hold": enabled})
+
+        if p == "/api/warm":
+            mid = body.get("model")
+            enabled = bool(body.get("enabled", True))
+            if not enabled:
+                set_state(warm=None)
+                log_event("keepwarm", enabled=False)
+                return self._json(200, {"warm": None})
+            _, models, _ = engine_state()
+            if mid not in [m.get("id") for m in models]:
+                return self._json(400, {"error": "unknown model", "model": mid})
+            set_state(warm=mid)
+            log_event("keepwarm", enabled=True, model=mid)
+            return self._json(200, {"warm": mid})
 
         if p == "/api/margin":
             try:
@@ -1151,6 +1226,7 @@ def main():
     srv = Server((LISTEN_HOST, LISTEN_PORT), Handler)
     st = get_state()
     threading.Thread(target=_watch_resident, daemon=True).start()
+    threading.Thread(target=_keep_warm, daemon=True).start()
     log_event("service_start", version=VERSION, port=LISTEN_PORT)
     if GATE_ENABLED:
         gate_srv = Server((LISTEN_HOST, GATE_PORT), GateHandler)
