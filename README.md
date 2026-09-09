@@ -190,7 +190,9 @@ CORS is allow-listed to the dashboard origins; a foreign origin gets no `Access-
 
 ## Naming
 
-The service was originally `nemotron-card`, when it controlled exactly one model. It grew into a general model selector. The reference deployment still runs under the old unit name; this repo uses the current one. If you are migrating, the ports and the API are unchanged — only paths and the unit name move.
+The service was originally `nemotron-card`, when it controlled exactly one model. It grew into a general model selector, and everything was renamed to `dgx-model-card` in 2.2.1.
+
+If you are upgrading from the old name: ports, the API and behaviour are unchanged — paths, the unit name and the console handle move. Stop and disable the old unit, run `install.sh`, then copy your old `state.json` into the new `StateDirectory` and restart so your selection, reserve and hold setting carry across. The console handle is now `window.__dgxModelCard`.
 
 ## Licence
 
