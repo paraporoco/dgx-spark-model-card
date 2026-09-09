@@ -38,6 +38,20 @@
 - The card shows the footprint everywhere it means "what this costs", and the
   weights-plus-projector figure where it means "bytes read from disk" (the
   load-time estimate).
+## 2.8.0 — 2026-09-09
+
+- **The load-time estimate is measured, not assumed.** 8.8 GiB/min was one
+  observation on one GB10 compiled into the card. It is now derived from this
+  host's own `load_ready` events and falls back to that constant only until
+  there is a sample worth having.
+- Two things had to be right for the number to be honest. The label says "if
+  not cached", so the statistic is the **25th percentile**, not the median — a
+  warm page cache reads several times faster than a cold load. And only loads
+  **at or above the size the estimate is shown for** count: a percentile of an
+  all-warm sample is still all warm.
+- The estimate says "(estimated)" while it is running on the fallback, so a
+  seeded guess is never mistaken for a measurement.
+- `/api/status` gains `load_rate: {gib_per_min, samples, source}`.
 
 ## 2.5.0 — 2026-09-09
 - **Keep warm.** A per-model toggle that refreshes the model's TTL before it expires, and reloads it if it has been evicted — so the cost of a cold load is paid on a schedule instead of on your next prompt. At most one model at a time, because llama-swap's `large` group is exclusive and two warm large models would evict each other in a loop.
