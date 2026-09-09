@@ -1,5 +1,7 @@
 # Changelog
 
+# Changelog
+
 ## 2.6.0 — 2026-09-09
 
 - **The gate refuses image requests to models that cannot see.** A request
@@ -16,6 +18,26 @@
 
   Best case it catches: an image request naming a 65 GiB text model, refused in
   milliseconds instead of starting a load that could never have answered.
+## 2.7.0 — 2026-09-09
+
+- **The memory guard counts the whole footprint**, not just the weights file:
+  `weights + multimodal projector + KV cache at the configured context`.
+  Previously it stat'd the `-m` path and nothing else, so a vision model was
+  under-counted by its projector (0.4-2.5 GiB) and every model by its KV cache
+  (5.0 GiB for Devstral at 32k, 8.0 GiB for Qwen2.5-Coder-32B at 32k).
+- **KV is read from the GGUF header**, stdlib only, cached on mtime. Hybrid
+  models publish `attention.head_count_kv` as a per-block array with 0 for the
+  Mamba layers; summing it keeps the estimate from charging attention memory
+  for layers that have none. Treating `block_count` as the layer count would
+  have charged Nemotron ~22 GiB instead of the correct 0.5.
+- **Refusals name the parts**: `needs 75.6 GiB (weights 65.1 + KV 0.5 + 10.0
+  margin)` rather than `model 65.1`.
+- `/api/status` gains `mmproj_gib`, `kv_gib`, `footprint_gib` and `ctx`.
+  `size_gib` keeps its old meaning — the weights file — so nothing downstream
+  silently changes units.
+- The card shows the footprint everywhere it means "what this costs", and the
+  weights-plus-projector figure where it means "bytes read from disk" (the
+  load-time estimate).
 
 ## 2.5.0 — 2026-09-09
 - **Keep warm.** A per-model toggle that refreshes the model's TTL before it expires, and reloads it if it has been evicted — so the cost of a cold load is paid on a schedule instead of on your next prompt. At most one model at a time, because llama-swap's `large` group is exclusive and two warm large models would evict each other in a loop.

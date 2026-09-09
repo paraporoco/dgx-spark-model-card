@@ -174,6 +174,23 @@ nemotron-3-super-120b  exclusive=True   → "33.6 GiB free after load"   # 94.7 
 nomic-embed-v2-moe     exclusive=False  → "93.8 GiB free after load"   # 94.7 − 0.9, no credit
 ```
 
+### What "size" means
+
+```
+footprint = weights (-m) + projector (--mmproj) + KV cache (-c)
+needed    = footprint + margin
+```
+
+The KV term comes from the GGUF header — block count, KV head count, key and
+value lengths — and assumes one unified cache of `n_ctx` with f16 elements
+unless `-ctk` says otherwise. Hybrid models (Nemotron-H, Qwen3-Next) publish
+`attention.head_count_kv` as a per-block array with `0` for their Mamba layers;
+those zeros are respected, so the estimate does not charge attention memory to
+layers that have none.
+
+Still outside the estimate: the compute graph and the vision encoder's scratch
+buffers. That is what the margin is for.
+
 ## Configuration
 
 | Variable | Default | Meaning |
