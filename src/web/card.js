@@ -1,7 +1,7 @@
-/* nemotron-card v2.2 — "Local models" card for the NVIDIA DGX Dashboard.
+/* dgx-model-card v2.2 — "Local models" card for the NVIDIA DGX Dashboard.
  *
  * Touches no NVIDIA file. Mounts one node into the card grid; removed with
- * window.__nemotronCard.destroy().
+ * window.__dgxModelCard.destroy().
  *
  * Layout is deliberately three labelled blocks — LOADED NOW / MEMORY /
  * LOAD A MODEL — so status and intent are never the same widget.
@@ -9,8 +9,8 @@
 (function () {
   "use strict";
 
-  if (window.__nemotronCard && window.__nemotronCard.destroy) {
-    window.__nemotronCard.destroy();
+  if (window.__dgxModelCard && window.__dgxModelCard.destroy) {
+    window.__dgxModelCard.destroy();
   }
 
   var API = (function () {
@@ -19,7 +19,7 @@
     return "http://127.0.0.1:8110";
   })();
 
-  var MOUNT_ID = "nemotron-card-root";
+  var MOUNT_ID = "dgx-model-card-root";
   var POLL_IDLE = 6000, POLL_BUSY = 2500;
   var timer = null, observer = null, logsOpen = false, busy = false;
   var lastStatus = null, notice = null;
@@ -367,7 +367,7 @@
           [String(st.last_error)]) : null,
 
         logsOpen ? el("pre", {
-          id: "nemotron-card-logs",
+          id: "dgx-model-card-logs",
           style: "margin:0;max-height:180px;overflow:auto;font-size:11px;line-height:1.45;background:" +
                  RAISED + ";padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-all;opacity:.85;"
         }, ["loading logs…"]) : null
@@ -428,7 +428,7 @@
 
   function loadLogs() {
     api("/api/logs?n=120").then(function (r) {
-      var p = document.getElementById("nemotron-card-logs");
+      var p = document.getElementById("dgx-model-card-logs");
       if (p) { p.textContent = (r.body.lines || []).join("\n") || "(empty)"; p.scrollTop = p.scrollHeight; }
     }).catch(function () {});
   }
@@ -467,14 +467,14 @@
     setTimeout(function () { waitForGrid(n + 1); }, 500);
   }
 
-  window.__nemotronCard = {
+  window.__dgxModelCard = {
     api: API, refresh: tick,
     destroy: function () {
       if (timer) clearTimeout(timer);
       if (observer) observer.disconnect();
       var n = document.getElementById(MOUNT_ID);
       if (n && n.parentElement) n.parentElement.removeChild(n);
-      delete window.__nemotronCard;
+      delete window.__dgxModelCard;
     }
   };
 

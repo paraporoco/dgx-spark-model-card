@@ -28,7 +28,7 @@
  * Remove it
  *   Toggle the script off. Nothing on disk changes. To drop the card without
  *   touching the extension, run in the console:
- *       window.__nemotronCard.destroy()
+ *       window.__dgxModelCard.destroy()
  *
  * Remote use
  *   The sidecar binds 127.0.0.1 only. Browsing the dashboard from another

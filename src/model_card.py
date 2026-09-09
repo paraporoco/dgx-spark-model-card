@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-nemotron-card — sidecar control service for the GX10 DGX Dashboard.
+dgx-model-card — sidecar control service for the NVIDIA DGX Dashboard.
 
 Controls llama-swap-managed models over loopback HTTP. Requires no root,
 no polkit rule, no sudoers entry, and touches nothing under /opt/nvidia/.
@@ -30,7 +30,7 @@ import urllib.request
 # ---------------------------------------------------------------- config
 
 SWAP = os.environ.get("NC_SWAP_URL", "http://127.0.0.1:8100").rstrip("/")
-DEFAULT_MODEL = os.environ.get("NC_MODEL", "nemotron-3-super-120b")
+DEFAULT_MODEL = os.environ.get("NC_MODEL", "")   # empty -> first model llama-swap reports
 LISTEN_HOST = os.environ.get("NC_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("NC_PORT", "8110"))
 WEBROOT = os.environ.get(
@@ -435,7 +435,7 @@ def build_status():
 # ---------------------------------------------------------------- http
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    server_version = "nemotron-card/" + VERSION
+    server_version = "dgx-model-card/" + VERSION
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -640,7 +640,7 @@ def gate_decision(path, body_bytes):
 
 
 class GateHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "nemotron-card-gate/" + VERSION
+    server_version = "dgx-model-card-gate/" + VERSION
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -677,8 +677,9 @@ class GateHandler(http.server.BaseHTTPRequestHandler):
         _gate_stats["last_refusal"] = detail or reason
         _gate_stats["last_refused_model"] = model
         _gate_stats["last_refused_at"] = int(time.time())
-        msg = ("nemotron-card: loading '%s' was refused -- %s. "
-               "Turn off Hold on the model card, or free memory, then retry."
+        msg = ("dgx-model-card: loading '%s' was refused -- %s. "
+               "Set automatic loading to Allowed on the Local models card, "
+               "or free memory, then retry."
                % (model, detail or reason))
         print("GATE REFUSED %s (%s): %s" % (model, reason, detail), flush=True)
         payload = json.dumps({
@@ -710,7 +711,7 @@ class GateHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             try:
                 payload = json.dumps({"error": {
-                    "message": "nemotron-card gate: upstream llama-swap unreachable (%s)" % e,
+                    "message": "dgx-model-card gate: upstream llama-swap unreachable (%s)" % e,
                     "type": "upstream_unavailable"}}).encode()
                 self.send_response(502)
                 self.send_header("Content-Type", "application/json")
@@ -791,7 +792,7 @@ def main():
         threading.Thread(target=gate_srv.serve_forever, daemon=True).start()
         print("gate listening on %s:%d -> %s:%d"
               % (LISTEN_HOST, GATE_PORT, SWAP_HOST, SWAP_PORT), flush=True)
-    print("nemotron-card %s on %s:%d  selected=%s  hold=%s  margin=%.1f GiB  swap=%s"
+    print("dgx-model-card %s on %s:%d  selected=%s  hold=%s  margin=%.1f GiB  swap=%s"
           % (VERSION, LISTEN_HOST, LISTEN_PORT, st["selected"], st["hold"],
              st["margin_gib"], SWAP), flush=True)
     try:

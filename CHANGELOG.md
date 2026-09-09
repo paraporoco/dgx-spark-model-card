@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.2.1 — 2026-09-09
+- Renamed every user-visible identifier from the historical `nemotron-card` to `dgx-model-card`: `Server:` headers, the refusal message, the startup line, the injected mount and log element ids, and the console handle **`window.__nemotronCard` -> `window.__dgxModelCard`**.
+- Refusal text now names the actual control: *"Set automatic loading to Allowed on the Local models card"*.
+- `NC_MODEL` now defaults to empty (first model llama-swap reports) instead of a model specific to the author's box.
+- No behavioural change. Reference deployment migrated with `install.sh`, state carried across.
+
 ## 2.2.0 — 2026-09-07
 - Rebuilt the card as three labelled blocks: **Loaded now / Memory / Load a model**, so status and intent are never the same widget.
 - Model selector annotates every option with size and whether it fits.
