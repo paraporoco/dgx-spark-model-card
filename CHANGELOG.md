@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.3.0 — 2026-09-09
+- **Memory attribution.** The card names what is holding the memory, via `nvidia-smi --query-compute-apps` — on unified memory that is the only view that sees it. A job holding 74 GiB shows ~2.6 GiB of RSS and nothing in cgroup accounting. Holders are listed under the memory bar, tagged `model` or `other`, and the largest non-model holder is named in the refusal itself.
+- **Held outside llama-swap** is stated explicitly. The guard cannot reclaim memory taken by something it does not manage, and the card now says so instead of leaving it to be inferred.
+- **Hold and headroom no longer mask each other.** They are independent conditions; both are evaluated and both reported (`blockers: ["hold","headroom"]`). Previously Hold short-circuited the check, hiding whether the model would also have failed to fit.
+- **Event log.** `$STATE_DIRECTORY/events.jsonl` records load start/ready with real durations, unloads, evictions, refusals with reason and requesting client, and hold changes. A background watcher diffs llama-swap's resident set, so loads caused by *other* clients are recorded too. Exposed at `GET /api/events?n=` and shown as "Recent activity" in the log drawer.
+- Gate records the requesting `User-Agent`, so the card can say who asked, not just what was asked for.
+
+
 ## 2.2.1 — 2026-09-09
 - Renamed every user-visible identifier from the historical `nemotron-card` to `dgx-model-card`: `Server:` headers, the refusal message, the startup line, the injected mount and log element ids, and the console handle **`window.__nemotronCard` -> `window.__dgxModelCard`**.
 - Refusal text now names the actual control: *"Set automatic loading to Allowed on the Local models card"*.

@@ -45,13 +45,18 @@ STATE_PATH = os.path.join(STATE_DIR.split(":")[0], "state.json")
 # KV cache, CUDA context, and whatever else is running on the box.
 DEFAULT_MARGIN_GIB = float(os.environ.get("NC_MARGIN_GIB", "10"))
 
+# Event log. Answers "what happened while I was away" — the gate already sees
+# every load, eviction and refusal; without this it discards all of it.
+EVENTS_MAX = int(os.environ.get("NC_EVENTS_MAX", "2000"))
+MIN_HOLDER_BYTES = int(float(os.environ.get("NC_MIN_HOLDER_GIB", "0.5")) * (1 << 30))
+
 ALLOWED_ORIGINS = {
     "http://localhost:11000", "http://127.0.0.1:11000",
     "http://localhost:11005", "http://127.0.0.1:11005",
     "http://localhost:8110", "http://127.0.0.1:8110",
 }
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 GATE_PORT = int(os.environ.get("NC_GATE_PORT", "8111"))
 GATE_ENABLED = os.environ.get("NC_GATE", "1") not in ("0", "false", "no")
@@ -60,7 +65,7 @@ SWAP_PORT = int(os.environ.get("NC_SWAP_PORT", "8100"))
 _gate_stats = {"passed": 0, "refused": 0, "last_refusal": None,
                "last_refused_model": None, "last_refused_at": None,
                "last_model": None, "last_model_at": None,
-               "last_model_loaded": False}
+               "last_model_loaded": False, "last_client": None}
 STARTED_AT = time.time()
 
 # ---------------------------------------------------------------- state
@@ -247,6 +252,72 @@ def engine_state():
 GIB = 1073741824
 
 
+_holders_cache = {"at": 0.0, "rows": []}
+
+
+def gpu_holders():
+    """Processes holding GPU memory, largest first.
+
+    On GB10 this is the ONLY view that sees it: a job holding 74 GiB of unified
+    memory shows ~2.6 GiB of RSS and nothing in cgroup accounting. Without this
+    the card can report "not enough memory" but never say what took it.
+    """
+    now = time.time()
+    if now - _holders_cache["at"] < 5:
+        return _holders_cache["rows"]
+
+    rows = []
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=6).stdout
+        for line in out.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 3:
+                continue
+            try:
+                pid, name, mib = int(parts[0]), parts[1], float(parts[2])
+            except ValueError:
+                continue
+            b = int(mib * 1048576)
+            if b < MIN_HOLDER_BYTES:
+                continue
+            rows.append({"pid": pid, "name": os.path.basename(name),
+                         "bytes": b, "ours": False, "cmd": "", "elapsed": ""})
+    except Exception:
+        return _holders_cache["rows"]
+
+    # Which of these are llama-swap's own upstreams? Anything else is memory the
+    # guard cannot reclaim, and the card must say so rather than imply otherwise.
+    for r in rows:
+        try:
+            with open("/proc/%d/cmdline" % r["pid"], "rb") as fh:
+                cmd = fh.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+            r["cmd"] = cmd[:160]
+            r["ours"] = "llama-server" in cmd
+            if not r["name"] or r["name"] in ("python", "python3"):
+                for tok in cmd.split():
+                    if tok.endswith(".py"):
+                        r["name"] = os.path.basename(tok)
+                        break
+            with open("/proc/%d/stat" % r["pid"]) as fh:
+                pass
+        except Exception:
+            pass
+
+    rows.sort(key=lambda x: -x["bytes"])
+    _holders_cache.update({"at": now, "rows": rows})
+    return rows
+
+
+def held_outside():
+    """(bytes, largest_row) held by processes that are not llama-swap upstreams."""
+    rows = [r for r in gpu_holders() if not r["ours"]]
+    return sum(r["bytes"] for r in rows), (rows[0] if rows else None)
+
+
 def mem_info():
     try:
         vals = {}
@@ -259,6 +330,49 @@ def mem_info():
         return {"total": None, "available": None}
 
 
+EVENTS_PATH = os.path.join(STATE_DIR.split(":")[0], "events.jsonl")
+_events_lock = threading.Lock()
+
+
+def log_event(kind, **fields):
+    rec = {"ts": int(time.time()), "kind": kind}
+    rec.update({k: v for k, v in fields.items() if v is not None})
+    line = json.dumps(rec, separators=(",", ":"))
+    try:
+        with _events_lock:
+            os.makedirs(os.path.dirname(EVENTS_PATH), exist_ok=True)
+            with open(EVENTS_PATH, "a") as fh:
+                fh.write(line + "\n")
+            # cheap rotation: only when the file is plausibly large
+            if os.path.getsize(EVENTS_PATH) > EVENTS_MAX * 200:
+                with open(EVENTS_PATH) as fh:
+                    keep = fh.readlines()[-EVENTS_MAX:]
+                tmp = EVENTS_PATH + ".tmp"
+                with open(tmp, "w") as fh:
+                    fh.writelines(keep)
+                os.replace(tmp, EVENTS_PATH)
+    except Exception as e:  # noqa: BLE001
+        print("event log write failed: %s" % e, flush=True)
+    print("EVENT %s %s" % (kind, line), flush=True)
+
+
+def read_events(n=50):
+    try:
+        with open(EVENTS_PATH) as fh:
+            lines = fh.readlines()[-n:]
+        out = []
+        for l in lines:
+            try:
+                out.append(json.loads(l))
+            except Exception:
+                pass
+        return out
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+
+
 def evaluate_load(model_id, running_ids):
     """Can this model be loaded right now? Returns (ok, reason, detail).
 
@@ -267,12 +381,13 @@ def evaluate_load(model_id, running_ids):
     is mapped.
     """
     st = get_state()
-    if st["hold"]:
-        return False, "hold", "loading is on hold"
+    held = st["hold"]
 
     size = model_size_bytes(model_id)
     mem = mem_info()
     if size is None or mem["available"] is None:
+        if held:
+            return False, "hold", "loading is on hold"
         return True, "unknown", "size or memory unknown — guard not enforced"
 
     grp = group_of(model_id)
@@ -287,16 +402,34 @@ def evaluate_load(model_id, running_ids):
     effective = mem["available"] + reclaimed
     needed = size + margin
 
-    if effective < needed:
-        return (False, "headroom",
-                "needs %.1f GiB (model %.1f + %.1f margin), %.1f GiB would be free"
-                % (needed / GIB, size / GIB, margin / GIB, effective / GIB))
+    fits = effective >= needed
+    short = ("needs %.1f GiB (model %.1f + %.1f margin), %.1f GiB would be free"
+             % (needed / GIB, size / GIB, margin / GIB, effective / GIB))
+
+    # Name what is holding the memory. A refusal without this is true and
+    # useless: the next question is always "taken by what?".
+    outside, biggest = held_outside()
+    if not fits and biggest is not None:
+        short += (". Largest holder: %s (pid %d) — %.1f GiB"
+                  % (biggest["name"], biggest["pid"], biggest["bytes"] / GIB))
+
+    # Hold and headroom are independent. Report both instead of letting the
+    # first one hide the state of the machine.
+    if held and not fits:
+        return False, "hold+headroom", "loading is on hold. It would also not fit: " + short
+    if held:
+        return False, "hold", "loading is on hold"
+    if not fits:
+        return False, "headroom", short
     return True, "ok", "%.1f GiB free after load" % ((effective - size) / GIB)
 
 
 # ---------------------------------------------------------------- workers
 
 def _load_worker(model_id):
+    t0 = time.time()
+    log_event("load_start", model=model_id,
+              size_gib=round((model_size_bytes(model_id) or 0) / GIB, 1))
     try:
         try:
             swap_get("/upstream/%s/health" % model_id, timeout=3600)
@@ -319,15 +452,49 @@ def _load_worker(model_id):
         urllib.request.urlopen(req, timeout=3600).read()
         _set_pending(None)
     except Exception as e:  # noqa: BLE001
+        log_event("load_failed", model=model_id,
+                  duration_s=int(time.time() - t0), error="%s: %s" % (type(e).__name__, e))
         _set_pending(None, error="%s: %s" % (type(e).__name__, e))
 
 
 def _unload_worker():
     try:
         swap_get("/unload", timeout=120)
+        log_event("unload_requested")
         _set_pending(None)
     except Exception as e:  # noqa: BLE001
         _set_pending(None, error="%s: %s" % (type(e).__name__, e))
+
+
+def _watch_resident():
+    """Diff llama-swap's resident set so loads, evictions and unloads are recorded
+    even when another client caused them."""
+    prev = None
+    starts = {}
+    while True:
+        try:
+            _, r = swap_json("/running", timeout=6)
+            cur = {x.get("model"): (x.get("state") or "") for x in r.get("running", [])}
+        except Exception:
+            time.sleep(10)
+            continue
+
+        if prev is not None:
+            for mid, stt in cur.items():
+                if mid not in prev and stt != "ready":
+                    starts[mid] = time.time()
+                was = prev.get(mid)
+                if stt == "ready" and was != "ready":
+                    t0 = starts.pop(mid, None)
+                    log_event("load_ready", model=mid,
+                              duration_s=int(time.time() - t0) if t0 else None,
+                              size_gib=round((model_size_bytes(mid) or 0) / GIB, 1))
+            for mid in prev:
+                if mid not in cur:
+                    log_event("unloaded", model=mid,
+                              replaced_by=(", ".join(k for k in cur if k not in prev) or None))
+        prev = cur
+        time.sleep(5)
 
 
 # ---------------------------------------------------------------- status
@@ -339,6 +506,7 @@ def build_status():
     cfg = parse_swap_config()
     mem = mem_info()
 
+    outside_bytes, _biggest = held_outside()
     running_by_id = {r.get("model"): r for r in running}
     running_ids = list(running_by_id)
 
@@ -376,6 +544,7 @@ def build_status():
             "can_load": ok,
             "load_reason": reason,
             "load_detail": detail,
+            "blockers": ([] if ok else reason.split("+")),
         })
 
     selected = st["selected"]
@@ -414,6 +583,12 @@ def build_status():
         "memory": {
             "total_gib": round(mem["total"] / GIB, 1) if mem["total"] else None,
             "available_gib": round(mem["available"] / GIB, 1) if mem["available"] else None,
+            "held_outside_gib": round(outside_bytes / GIB, 1) if outside_bytes else 0,
+            "holders": [
+                {"pid": h["pid"], "name": h["name"], "gib": round(h["bytes"] / GIB, 1),
+                 "ours": h["ours"], "cmd": h["cmd"]}
+                for h in gpu_holders()
+            ],
         },
         "gate": {
             "enabled": GATE_ENABLED,
@@ -426,6 +601,7 @@ def build_status():
             "last_model": _gate_stats["last_model"],
             "last_model_at": _gate_stats["last_model_at"],
             "last_model_loaded": _gate_stats["last_model_loaded"],
+            "last_client": _gate_stats["last_client"],
         },
         "sidecar_uptime_s": int(time.time() - STARTED_AT),
         "ts": int(time.time()),
@@ -514,6 +690,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(200, {"lines": lines[-n:]})
             except Exception as e:  # noqa: BLE001
                 return self._json(502, {"error": str(e), "lines": []})
+        if p == "/api/events":
+            n = 30
+            if "?" in self.path:
+                from urllib.parse import parse_qs
+                q = parse_qs(self.path.split("?", 1)[1])
+                try:
+                    n = max(1, min(500, int(q.get("n", ["30"])[0])))
+                except ValueError:
+                    pass
+            return self._json(200, {"events": read_events(n)})
         if p == "/healthz":
             return self._json(200, {"ok": True, "version": VERSION})
         return self._json(404, {"error": "not found"})
@@ -525,6 +711,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if p == "/api/hold":
             enabled = bool(body.get("enabled"))
             set_state(hold=enabled)
+            log_event("hold", enabled=enabled)
             return self._json(200, {"hold": enabled})
 
         if p == "/api/margin":
@@ -598,7 +785,7 @@ def resident_ids():
         return None      # unknown -> caller fails open
 
 
-def gate_decision(path, body_bytes):
+def gate_decision(path, body_bytes, client=None):
     """(allow, model_id, reason, detail).
 
     Fails OPEN on anything it cannot determine: an unparseable body, an
@@ -625,6 +812,7 @@ def gate_decision(path, body_bytes):
 
     _gate_stats["last_model"] = model
     _gate_stats["last_model_at"] = int(time.time())
+    _gate_stats["last_client"] = client
 
     running = resident_ids()
     if running is None:
@@ -677,6 +865,8 @@ class GateHandler(http.server.BaseHTTPRequestHandler):
         _gate_stats["last_refusal"] = detail or reason
         _gate_stats["last_refused_model"] = model
         _gate_stats["last_refused_at"] = int(time.time())
+        log_event("refused", model=model, reason=reason, detail=detail or None,
+                  client=(self.headers.get("User-Agent") or "")[:60] or None)
         msg = ("dgx-model-card: loading '%s' was refused -- %s. "
                "Set automatic loading to Allowed on the Local models card, "
                "or free memory, then retry."
@@ -766,7 +956,8 @@ class GateHandler(http.server.BaseHTTPRequestHandler):
     def _handle(self):
         body = self._read_body()
         try:
-            allow, model, reason, detail = gate_decision(self.path, body)
+            allow, model, reason, detail = gate_decision(
+                self.path, body, (self.headers.get("User-Agent") or "")[:60])
         except Exception as e:  # noqa: BLE001
             print("gate decision error (failing open): %s" % e, flush=True)
             allow, model, reason, detail = True, None, "error", ""
@@ -787,6 +978,8 @@ def main():
     parse_swap_config()
     srv = Server((LISTEN_HOST, LISTEN_PORT), Handler)
     st = get_state()
+    threading.Thread(target=_watch_resident, daemon=True).start()
+    log_event("service_start", version=VERSION, port=LISTEN_PORT)
     if GATE_ENABLED:
         gate_srv = Server((LISTEN_HOST, GATE_PORT), GateHandler)
         threading.Thread(target=gate_srv.serve_forever, daemon=True).start()

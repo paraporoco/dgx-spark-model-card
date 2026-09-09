@@ -1,4 +1,4 @@
-/* dgx-model-card v2.2 — "Local models" card for the NVIDIA DGX Dashboard.
+/* dgx-model-card v2.3 — "Local models" card for the NVIDIA DGX Dashboard.
  *
  * Touches no NVIDIA file. Mounts one node into the card grid; removed with
  * window.__dgxModelCard.destroy().
@@ -36,6 +36,7 @@
 
   var LBL = "nv-text nv-text--body-regular-sm";
   var MONO = "nv-text nv-text--mono-sm";
+  var DIM  = "opacity:.7;";
 
   function api(path, opts) {
     return fetch(API + path, Object.assign({ mode: "cors", cache: "no-store" }, opts || {}))
@@ -196,6 +197,29 @@
       }, ["+"])
     ]);
 
+    // Who is holding it. On unified memory this is the only place the answer
+    // exists: a job holding 74 GiB shows ~2.6 GiB of RSS and nothing in cgroups.
+    var holders = (mem.holders || []).filter(function (h) { return h.gib >= 0.5; });
+    var holderRows = holders.length
+      ? el("div", { style: "display:flex;flex-direction:column;gap:3px;padding-top:2px;" },
+          [el("span", { class: LBL, style: DIM }, [
+            "Held by" + (mem.held_outside_gib ? "  ·  " + mem.held_outside_gib +
+              " GiB outside llama-swap, which the guard cannot reclaim" : "")
+          ])].concat(holders.slice(0, 5).map(function (h) {
+            return el("div", {
+              style: "display:flex;align-items:baseline;gap:8px;",
+              title: h.cmd || ""
+            }, [
+              el("span", { class: MONO, style: "min-width:62px;text-align:right;" },
+                 [h.gib + " GiB"]),
+              el("span", { class: LBL }, [h.name]),
+              el("span", { class: LBL, style: DIM }, ["pid " + h.pid]),
+              h.ours ? el("span", { class: "nv-tag nv-tag--color-green nv-tag--kind-outline" }, ["model"])
+                     : el("span", { class: "nv-tag nv-tag--color-gray nv-tag--kind-outline" }, ["other"])
+            ]);
+          })))
+      : null;
+
     return el("div", { style: "display:flex;flex-direction:column;gap:8px;" }, [
       heading("Memory"),
       bar,
@@ -205,7 +229,8 @@
           el("span", { class: LBL, style: "color:" + MUTED + ";" }, ["Keep free:"]),
           stepper
         ])
-      ])
+      ]),
+      holderRows
     ]);
   }
 
@@ -239,14 +264,22 @@
     } else if (sel.state === "starting") {
       plan = sel.name + " is loading now.";
       planColor = WARN;
-    } else if (!sel.can_load && sel.load_reason === "hold") {
-      plan = "Automatic loading is blocked, so Start is disabled. Allow it below to load " + sel.name + ".";
-      planColor = WARN;
     } else if (!sel.can_load) {
-      plan = "Not enough memory: " + sel.name + " needs " + sel.needed_gib +
-             " GiB free (" + sel.size_gib + " model + " + st.margin_gib + " reserve), " +
-             sel.effective_gib + " GiB available.";
-      planColor = ERR;
+      // blockers is an array: hold and headroom are independent conditions and
+      // neither should hide the other.
+      var b = sel.blockers || [sel.load_reason];
+      var parts = [];
+      if (b.indexOf("hold") !== -1) parts.push("Automatic loading is blocked.");
+      if (b.indexOf("headroom") !== -1) {
+        parts.push("Not enough memory: " + sel.name + " needs " + sel.needed_gib +
+                   " GiB free (" + sel.size_gib + " model + " + st.margin_gib +
+                   " reserve), " + sel.effective_gib + " GiB available.");
+        var big = ((st.memory || {}).holders || []).filter(function (h) { return !h.ours; })[0];
+        if (big) parts.push("Largest holder: " + big.name + " (pid " + big.pid + ") — " + big.gib + " GiB.");
+      }
+      if (!parts.length) parts.push(sel.load_detail);
+      plan = parts.join(" ");
+      planColor = b.indexOf("headroom") !== -1 ? ERR : WARN;
     } else {
       var e = eta(sel.size_gib);
       plan = "Start will " +
@@ -366,6 +399,16 @@
         st.last_error ? el("div", { class: LBL, style: "color:" + ERR + ";word-break:break-word;" },
           [String(st.last_error)]) : null,
 
+        logsOpen ? el("div", { style: "display:flex;flex-direction:column;gap:6px;" }, [
+          heading("Recent activity"),
+          el("pre", {
+            id: "dgx-model-card-events",
+            style: "margin:0;max-height:150px;overflow:auto;font-size:11px;line-height:1.5;background:" +
+                   RAISED + ";padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-word;"
+          }, ["loading…"]),
+          heading("Engine log")
+        ]) : null,
+
         logsOpen ? el("pre", {
           id: "dgx-model-card-logs",
           style: "margin:0;max-height:180px;overflow:auto;font-size:11px;line-height:1.45;background:" +
@@ -430,6 +473,23 @@
     api("/api/logs?n=120").then(function (r) {
       var p = document.getElementById("dgx-model-card-logs");
       if (p) { p.textContent = (r.body.lines || []).join("\n") || "(empty)"; p.scrollTop = p.scrollHeight; }
+    }).catch(function () {});
+    api("/api/events?n=12").then(function (r) {
+      var p = document.getElementById("dgx-model-card-events");
+      if (!p) return;
+      var ev = (r.body.events || []).slice().reverse();
+      if (!ev.length) { p.textContent = "(no activity recorded yet)"; return; }
+      p.textContent = ev.map(function (e) {
+        var t = new Date(e.ts * 1000).toLocaleTimeString();
+        var bits = [];
+        if (e.model) bits.push(e.model);
+        if (e.duration_s !== undefined) bits.push("in " + e.duration_s + "s");
+        if (e.reason) bits.push(e.reason);
+        if (e.client) bits.push("via " + e.client);
+        if (e.enabled !== undefined) bits.push(e.enabled ? "on" : "off");
+        if (e.replaced_by) bits.push("replaced by " + e.replaced_by);
+        return t + "  " + e.kind + (bits.length ? "  " + bits.join(" · ") : "");
+      }).join("\n");
     }).catch(function () {});
   }
 

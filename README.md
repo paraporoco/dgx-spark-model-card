@@ -48,6 +48,8 @@ More importantly, on a **unified-memory** machine the models and everything else
 - **Plain-language plan**: one sentence saying exactly what Start will do, including which model it will evict.
 - **Load gate** — an optional reverse proxy in front of llama-swap that refuses loads which are blocked or which will not fit, for *every* client, not just this card.
 - **Last asked for by a client** — read from the gate's own traffic, so you can see what your editor is about to load.
+- **Memory attribution** — names the processes holding GPU memory, and marks how much of it is held *outside* llama-swap where the guard cannot reclaim it.
+- **Event log** — loads with real durations, evictions, refusals with reason and requester, hold changes; recorded even when another client caused them.
 
 ## The compatibility rule
 
@@ -170,6 +172,7 @@ State (`selected`, `hold`, `margin_gib`) persists in `$STATE_DIRECTORY/state.jso
 | `POST /api/hold` | `{enabled}` |
 | `POST /api/margin` | `{gib}` |
 | `GET /api/logs?n=` | llama-swap log tail, own polling filtered out |
+| `GET /api/events?n=` | event log: loads, unloads, refusals, hold changes |
 | `GET /healthz` | liveness |
 
 CORS is allow-listed to the dashboard origins; a foreign origin gets no `Access-Control-Allow-Origin` header at all.
@@ -186,6 +189,7 @@ CORS is allow-listed to the dashboard origins; a foreign origin gets no `Access-
 - **Placement depends on the dashboard's DOM.** Developed against 0.29.2-2, where the card grid is `div.flex.gap-4.flex-wrap` and cards carry `data-testid="skele-panel"`. `findGrid()` tries three selectors, most specific first. A dashboard update can still move the card; it cannot break the dashboard. `packaging/99-dgx-model-card-apt-notice` prints a reminder to re-check when the package version changes.
 - **The gate shares a process with the card.** A crash there takes the inference path with it. Mitigated by `Restart=on-failure`, fail-open on every decision error, and a one-line bypass — point your proxy back at llama-swap.
 - **It reports what clients have asked for, not what they are configured to ask for.** The sidecar does not read your editor's config, by design.
+- **The guard governs llama-swap, not the machine.** Anything else on the box — a training job, LM Studio, another runtime — can take memory the card can see but cannot prevent or reclaim. That memory is reported as *held outside llama-swap* precisely so the limit is visible rather than assumed away.
 - The load-time estimate assumes ~8.8 GiB/min, measured on this hardware with a cold page cache. Yours will differ.
 
 ## Naming
