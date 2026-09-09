@@ -121,7 +121,6 @@
     return Math.floor(s / 3600) + " h ago";
   }
 
-<<<<<<< HEAD
   // What loading this model actually costs: weights + projector + KV cache.
   // size_gib alone is the weights file, which is what made vision models look
   // affordable when they were not.
@@ -137,17 +136,12 @@
     return (m.size_gib || 0) + (m.mmproj_gib || 0);
   }
 
-  function eta(gib) {
-    if (!gib || gib < 20) return null;
-    return "≈ " + Math.max(1, Math.round(gib / GIB_PER_MIN)) + " min if not cached";
-=======
   function eta(gib, st) {
     if (!gib || gib < 20) return null;   // matches NC_ETA_MIN_GIB
     var rate = loadRate(st);
     var measured = st && st.load_rate && st.load_rate.source === "measured";
     return "≈ " + Math.max(1, Math.round(gib / rate)) + " min if not cached"
            + (measured ? "" : " (estimated)");
->>>>>>> load-rate-from-events
   }
 
   // Tool-calling support is not visible anywhere else in the stack: a GGUF can
@@ -374,11 +368,7 @@
       plan = parts.join(" ");
       planColor = b.indexOf("headroom") !== -1 ? ERR : WARN;
     } else {
-<<<<<<< HEAD
-      var e = eta(diskGib(sel));
-=======
-      var e = eta(sel.size_gib, st);
->>>>>>> load-rate-from-events
+      var e = eta(diskGib(sel), st);
       plan = "Start will " +
              (sel.evicts && sel.evicts.length ? "unload " + sel.evicts.join(", ") + " and load " : "load ") +
              sel.name + " (" + footprint(sel) + " GiB" + (e ? ", " + e : "") + ").";
