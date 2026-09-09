@@ -747,6 +747,43 @@ def evaluate_load(model_id, running_ids):
 
 # ---------------------------------------------------------------- workers
 
+UPSTREAM_LOG_DIR = os.environ.get("NC_UPSTREAM_LOG_DIR", "/var/log/llama-swap")
+
+
+def upstream_error_tail(model_id, lines=12):
+    """Why the upstream actually died, if packaging/llama-server-logged is used.
+
+    llama-swap v251 keeps the upstream's stderr to itself -- /logs carries only
+    proxy lines and there is no /logs/upstream -- so every start failure reads
+    "upstream command exited prematurely" and nothing more. That is
+    indistinguishable between out of memory, a missing file and an unsupported
+    projector, and it sends you to the config when the machine was the problem.
+
+    The wrapper tees stderr per model; this reads the tail of the last start.
+    Without the wrapper this returns nothing and the caller is no worse off.
+    """
+    path = parse_swap_config()["paths"].get(model_id)
+    if not path:
+        return []
+    name = os.path.basename(path)
+    if name.endswith(".gguf"):
+        name = name[:-5]
+    try:
+        with open(os.path.join(UPSTREAM_LOG_DIR, name + ".err"),
+                  errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return []
+    # Only the most recent start; earlier ones are noise once it has failed.
+    marker = text.rfind("===== ")
+    if marker != -1:
+        text = text[marker:]
+    out = [l for l in text.splitlines() if l.strip()]
+    err = [l for l in out
+           if re.search(r"(?:\bE\b|ERR|error|failed|cannot|no such)", l)]
+    return (err or out)[-lines:]
+
+
 def _load_worker(model_id):
     t0 = time.time()
     log_event("load_start", model=model_id,
@@ -773,9 +810,15 @@ def _load_worker(model_id):
         urllib.request.urlopen(req, timeout=3600).read()
         _set_pending(None)
     except Exception as e:  # noqa: BLE001
+        msg = "%s: %s" % (type(e).__name__, e)
+        tail = upstream_error_tail(model_id)
+        if tail:
+            # llama-swap says a process exited. This says why.
+            msg += " | upstream: " + " / ".join(tail[-3:])
         log_event("load_failed", model=model_id,
-                  duration_s=int(time.time() - t0), error="%s: %s" % (type(e).__name__, e))
-        _set_pending(None, error="%s: %s" % (type(e).__name__, e))
+                  duration_s=int(time.time() - t0), error=msg,
+                  upstream=tail or None)
+        _set_pending(None, error=msg)
 
 
 def _unload_worker():
@@ -1103,6 +1146,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(200, {"lines": lines[-n:]})
             except Exception as e:  # noqa: BLE001
                 return self._json(502, {"error": str(e), "lines": []})
+        if p == "/api/upstream-log":
+            mid = get_state()["selected"]
+            if "?" in self.path:
+                from urllib.parse import parse_qs
+                q = parse_qs(self.path.split("?", 1)[1])
+                mid = (q.get("model") or [mid])[0]
+            return self._json(200, {"model": mid, "dir": UPSTREAM_LOG_DIR,
+                                    "lines": upstream_error_tail(mid, 200)})
         if p == "/api/events":
             n = 30
             if "?" in self.path:
