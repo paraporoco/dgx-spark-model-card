@@ -133,6 +133,29 @@ First SSE frame at 0.07 s, last at 8.20 s across 170 frames — genuinely increm
 
 Set `NC_GATE=0` to run the card without the gate.
 
+## The vision check
+
+A model with no `--mmproj` in its llama-swap `cmd` cannot read an image, and
+llama.cpp says so once per request:
+
+```
+400 Multimodal data provided, but model does not support multimodal requests.
+```
+
+At one frame per second that is a wall of identical errors naming neither the
+model nor the fix. The gate refuses those requests first:
+
+```
+503 dgx-model-card: 'devstral-24b' cannot serve this request -- it has no
+    vision projector, so it cannot read images.
+    Models that can: qwen3-vl-4b, qwen3-vl-8b
+```
+
+The check runs only on requests that actually carry `image_url`, so text
+traffic is untouched, and only when the swap config yields a non-empty roster —
+a parse failure makes it permissive rather than wrong. The roster is cached on
+the config's mtime.
+
 ## The memory guard
 
 Sizes come from `stat()` on the GGUF paths parsed out of llama-swap's config; group membership and `exclusive: true` come from the same parse. **A parse failure degrades to "size unknown", which makes the guard permissive rather than wrong.**

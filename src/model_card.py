@@ -56,7 +56,7 @@ ALLOWED_ORIGINS = {
     "http://localhost:8110", "http://127.0.0.1:8110",
 }
 
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 
 GATE_PORT = int(os.environ.get("NC_GATE_PORT", "8111"))
 GATE_ENABLED = os.environ.get("NC_GATE", "1") not in ("0", "false", "no")
@@ -1028,6 +1028,34 @@ def resident_ids():
         return None      # unknown -> caller fails open
 
 
+_vis_cache = {"mtime": 0.0, "ids": set()}
+
+
+def vision_capable_ids():
+    """Model ids whose llama-swap cmd carries an --mmproj - i.e. can see.
+
+    Same line-scanner discipline as parse_swap_config: any failure returns an
+    empty set, which makes the check permissive rather than wrong.
+    """
+    try:
+        mtime = os.stat(SWAP_CONFIG).st_mtime
+    except OSError:
+        return _vis_cache["ids"]
+    if mtime == _vis_cache["mtime"]:
+        return _vis_cache["ids"]
+    ids = set()
+    try:
+        text = open(SWAP_CONFIG).read()
+        for m in re.finditer(r"^  ([A-Za-z0-9._-]+):\n(.*?)(?=^  \S|\Z)",
+                             text, re.S | re.M):
+            if "--mmproj" in m.group(2):
+                ids.add(m.group(1))
+    except Exception:
+        return set()
+    _vis_cache["mtime"], _vis_cache["ids"] = mtime, ids
+    return ids
+
+
 def gate_decision(path, body_bytes, client=None):
     """(allow, model_id, reason, detail).
 
@@ -1052,6 +1080,13 @@ def gate_decision(path, body_bytes, client=None):
 
     if not model:
         return True, None, "no-model", ""
+
+    if p in LOADING_PATHS and body_bytes and b'"image_url"' in body_bytes[:262144]:
+        vis = vision_capable_ids()
+        if vis and model not in vis:
+            return (False, model, "not_multimodal",
+                    "it has no vision projector, so it cannot read images. "
+                    "Models that can: %s" % ", ".join(sorted(vis)))
 
     _gate_stats["last_model"] = model
     _gate_stats["last_model_at"] = int(time.time())
@@ -1114,10 +1149,15 @@ class GateHandler(http.server.BaseHTTPRequestHandler):
         ua = (self.headers.get("User-Agent") or "")[:60]
         log_event("refused", model=model, reason=reason, detail=detail or None,
                   client=client_label(ua), client_ua=ua or None)
-        msg = ("dgx-model-card: loading '%s' was refused -- %s. "
-               "Set automatic loading to Allowed on the Local models card, "
-               "or free memory, then retry."
-               % (model, detail or reason))
+        if reason == "not_multimodal":
+            # Nothing about loading or memory would fix this one.
+            msg = ("dgx-model-card: '%s' cannot serve this request -- %s"
+                   % (model, detail or reason))
+        else:
+            msg = ("dgx-model-card: loading '%s' was refused -- %s. "
+                   "Set automatic loading to Allowed on the Local models card, "
+                   "or free memory, then retry."
+                   % (model, detail or reason))
         print("GATE REFUSED %s (%s): %s" % (model, reason, detail), flush=True)
         payload = json.dumps({
             "error": {"message": msg, "type": "model_load_refused",

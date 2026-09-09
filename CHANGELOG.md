@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.6.0 — 2026-09-09
+
+- **The gate refuses image requests to models that cannot see.** A request
+  carrying `image_url` whose model has no `--mmproj` in its llama-swap `cmd` is
+  refused with `503 not_multimodal` before it reaches llama.cpp. Without this,
+  llama.cpp answers `400 "Multimodal data provided, but model does not support
+  multimodal requests."` once per camera frame, naming neither the model at
+  fault nor the fix.
+
+  The roster is read from the swap config and cached on mtime, so registering a
+  new vision model needs no code change. The refusal drops the usual "set
+  automatic loading to Allowed" advice, because neither loading nor memory
+  would fix this one.
+
+  Best case it catches: an image request naming a 65 GiB text model, refused in
+  milliseconds instead of starting a load that could never have answered.
+
 ## 2.5.0 — 2026-09-09
 - **Keep warm.** A per-model toggle that refreshes the model's TTL before it expires, and reloads it if it has been evicted — so the cost of a cold load is paid on a schedule instead of on your next prompt. At most one model at a time, because llama-swap's `large` group is exclusive and two warm large models would evict each other in a loop.
   - It obeys the same rules as everything else: **Blocked** stops a reload but not a ping (pinging a resident model allocates nothing), and the memory reserve applies to a reload exactly as to any other load. Verified live — blocked with `reason=hold` while loading was Blocked, then `keepwarm_reload` → ready once allowed.
