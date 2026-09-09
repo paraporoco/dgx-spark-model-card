@@ -7,7 +7,7 @@
 // touched by apt, so the anchor gets re-verified instead of quietly rotting.
 //
 // Verification after an upgrade:
-//   1. open http://localhost:11000, sign in, confirm the Nemotron card renders
+//   1. open http://localhost:11000, sign in, confirm the Local models card renders
 //   2. if it does not:  google-chrome --headless=new --no-sandbox \
 //        --virtual-time-budget=8000 --dump-dom http://127.0.0.1:11000/ \
 //        | grep -o 'class="flex gap-4[^"]*"'
@@ -16,5 +16,5 @@
 // Remove this file to disable the reminder.
 
 DPkg::Post-Invoke {
-  "if dpkg-query -W -f='${Version}' dgx-dashboard 2>/dev/null | grep -qv '^0\\.29\\.2-2$'; then echo ''; echo '  >> dgx-dashboard version changed. Re-verify the Nemotron card renders'; echo '     (see /etc/apt/apt.conf.d/99-dgx-model-card-notice), then update the'; echo '     pinned version in that file.'; echo ''; fi || true";
+  "if dpkg-query -W -f='${Version}' dgx-dashboard 2>/dev/null | grep -qv '^0\\.29\\.2-2$'; then echo ''; echo '  >> dgx-dashboard version changed. Re-verify the Local models card renders'; echo '     (see /etc/apt/apt.conf.d/99-dgx-model-card-apt-notice), then update the'; echo '     pinned version in that file.'; echo ''; fi || true";
 };
