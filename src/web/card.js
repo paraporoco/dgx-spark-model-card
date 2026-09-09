@@ -1,4 +1,4 @@
-/* dgx-model-card v2.3 — "Local models" card for the NVIDIA DGX Dashboard.
+/* dgx-model-card v2.3.1 — "Local models" card for the NVIDIA DGX Dashboard.
  *
  * Touches no NVIDIA file. Mounts one node into the card grid; removed with
  * window.__dgxModelCard.destroy().
@@ -142,8 +142,9 @@
         }, [
           el("span", { class: LBL, style: "color:" + MUTED + ";" }, ["Last asked for by a client:"]),
           el("span", { class: MONO }, [g.last_model]),
-          el("span", { class: LBL, style: "color:" + MUTED + ";" },
-             ["· " + (ago(g.last_model_at) || "") + " · " +
+          el("span", { class: LBL, style: "color:" + MUTED + ";", title: g.last_client || "" },
+             ["· " + (g.last_client_label || "unidentified client") +
+              " · " + (ago(g.last_model_at) || "") + " · " +
               (g.last_model_loaded ? "already loaded" : "triggered a load")])
         ])
       : el("div", {

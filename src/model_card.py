@@ -56,7 +56,7 @@ ALLOWED_ORIGINS = {
     "http://localhost:8110", "http://127.0.0.1:8110",
 }
 
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 
 GATE_PORT = int(os.environ.get("NC_GATE_PORT", "8111"))
 GATE_ENABLED = os.environ.get("NC_GATE", "1") not in ("0", "false", "no")
@@ -602,6 +602,7 @@ def build_status():
             "last_model_at": _gate_stats["last_model_at"],
             "last_model_loaded": _gate_stats["last_model_loaded"],
             "last_client": _gate_stats["last_client"],
+            "last_client_label": client_label(_gate_stats["last_client"]),
         },
         "sidecar_uptime_s": int(time.time() - STARTED_AT),
         "ts": int(time.time()),
@@ -777,6 +778,37 @@ LOADING_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings",
                  "/v1/rerank", "/v1/reranking")
 
 
+# Real User-Agents seen against this llama-swap, by volume:
+#   Python-urllib/3.12   this service's own polling (does not traverse the gate)
+#   OpenAI/JS 5.23.2     Continue.dev - its OpenAI provider uses the JS SDK
+#   curl/8.5.0           shell testing
+#   ...WindowsPowerShell PowerShell testing from a client machine
+CLIENT_LABELS = (
+    ("openai/js", "Continue (OpenAI JS SDK)"),
+    ("openai-python", "OpenAI Python SDK"),
+    ("python-urllib", "this card"),
+    ("python-requests", "Python script"),
+    ("powershell", "PowerShell"),
+    ("lmstudio", "LM Studio"),
+    ("ollama", "Ollama client"),
+    ("curl", "curl"),
+    ("wget", "wget"),
+    ("node", "Node client"),
+    ("mozilla", "browser"),
+)
+
+
+def client_label(ua):
+    """A readable name for a User-Agent, without throwing the raw string away."""
+    if not ua:
+        return None
+    low = ua.lower()
+    for needle, label in CLIENT_LABELS:
+        if needle in low:
+            return label
+    return ua.split("/")[0][:24] or None
+
+
 def resident_ids():
     try:
         _, r = swap_json("/running", timeout=4)
@@ -818,6 +850,9 @@ def gate_decision(path, body_bytes, client=None):
     if running is None:
         return True, model, "engine-unknown", ""
     _gate_stats["last_model_loaded"] = model in running
+    if model not in running:
+        log_event("load_requested", model=model, client=client_label(client),
+                  client_ua=client or None)
     if model in running:
         # Already loaded. Serving it allocates no new weights, so hold and the
         # headroom guard do not apply -- a warm session keeps working.
@@ -865,8 +900,9 @@ class GateHandler(http.server.BaseHTTPRequestHandler):
         _gate_stats["last_refusal"] = detail or reason
         _gate_stats["last_refused_model"] = model
         _gate_stats["last_refused_at"] = int(time.time())
+        ua = (self.headers.get("User-Agent") or "")[:60]
         log_event("refused", model=model, reason=reason, detail=detail or None,
-                  client=(self.headers.get("User-Agent") or "")[:60] or None)
+                  client=client_label(ua), client_ua=ua or None)
         msg = ("dgx-model-card: loading '%s' was refused -- %s. "
                "Set automatic loading to Allowed on the Local models card, "
                "or free memory, then retry."

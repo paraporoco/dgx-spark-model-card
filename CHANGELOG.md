@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.3.1 — 2026-09-09
+- **Name the client, don't just record it.** 2.3.0 captured the requesting `User-Agent` and never displayed it. The card now reads *"Last asked for by a client: qwen3-coder-next-80b · Continue (OpenAI JS SDK) · 41 s ago · triggered a load"*, with the raw User-Agent kept in the tooltip.
+- Labels derived from the User-Agents this stack actually produces — Continue.dev identifies as `OpenAI/JS`, since its OpenAI provider uses the JS SDK. Unknown agents degrade to their first path segment rather than being dropped.
+- The event log names the client too, and gained `load_requested` so a load can be attributed to whoever caused it, not only observed after the fact.
+
+
 ## 2.3.0 — 2026-09-09
 - **Memory attribution.** The card names what is holding the memory, via `nvidia-smi --query-compute-apps` — on unified memory that is the only view that sees it. A job holding 74 GiB shows ~2.6 GiB of RSS and nothing in cgroup accounting. Holders are listed under the memory bar, tagged `model` or `other`, and the largest non-model holder is named in the refusal itself.
 - **Held outside llama-swap** is stated explicitly. The guard cannot reclaim memory taken by something it does not manage, and the card now says so instead of leaving it to be inferred.
