@@ -56,7 +56,7 @@ ALLOWED_ORIGINS = {
     "http://localhost:8110", "http://127.0.0.1:8110",
 }
 
-VERSION = "2.5.0"
+VERSION = "2.8.0"
 
 GATE_PORT = int(os.environ.get("NC_GATE_PORT", "8111"))
 GATE_ENABLED = os.environ.get("NC_GATE", "1") not in ("0", "false", "no")
@@ -488,6 +488,54 @@ def read_events(n=50):
         return []
 
 
+# Measured cold on the first GB10 this ran on: 65.1 GiB in 7 min 24 s. Used
+# only until this host has produced enough load_ready events of its own.
+FALLBACK_GIB_PER_MIN = 8.8
+LOAD_RATE_MIN_SAMPLES = int(os.environ.get("NC_LOAD_RATE_MIN_SAMPLES", "3"))
+
+# The estimate is only ever shown above this size, so it is only ever learned
+# from loads of comparable size. Mixing in small loads is what makes it wrong:
+# see load_rate_gib_per_min().
+ETA_MIN_GIB = float(os.environ.get("NC_ETA_MIN_GIB", "20"))
+
+
+def load_rate_gib_per_min():
+    """This host's cold-load rate, from its own history.
+
+    Returns (rate, sample_count, source).
+
+    The figure it feeds is labelled "if not cached", so the statistic has to
+    match that claim, and two things break it if you let them.
+
+    A median over all loads is the first. A warm page cache turns a 4.5 GiB
+    load into 10 s -- 27 GiB/min, against the 8.8 GiB/min the same hardware
+    manages cold on a 65 GiB file. So take the slow end, the 25th percentile.
+
+    Small loads are the second, and the percentile does not save you from them.
+    Measured here: eleven real load_ready events, every one of them a model
+    under 5 GiB read straight back out of the page cache it had just been
+    downloaded into, giving a 25th percentile of 26.4 GiB/min. Applied to a
+    65 GiB cold load that predicts 2.5 minutes for something that takes 7.5.
+    A percentile of an all-warm sample is still all warm.
+
+    So only loads at or above the size the estimate is shown for count. On a
+    host that has never done a big load there is no sample worth having, and
+    saying so beats inventing one.
+    """
+    rates = []
+    for e in read_events(500):
+        if e.get("kind") != "load_ready":
+            continue
+        gib, secs = e.get("size_gib"), e.get("duration_s")
+        if gib and secs and secs > 0 and gib >= ETA_MIN_GIB:
+            rates.append(gib / (secs / 60.0))
+    if len(rates) < LOAD_RATE_MIN_SAMPLES:
+        return FALLBACK_GIB_PER_MIN, len(rates), "fallback"
+    rates.sort()
+    idx = max(0, int(len(rates) * 0.25) - 1) if len(rates) >= 4 else 0
+    return round(rates[idx], 1), len(rates), "measured"
+
+
 def evaluate_load(model_id, running_ids):
     """Can this model be loaded right now? Returns (ok, reason, detail).
 
@@ -773,6 +821,8 @@ def build_status():
         "hold": st["hold"],
         "warm": st.get("warm"),
         "margin_gib": st["margin_gib"],
+        "load_rate": dict(zip(("gib_per_min", "samples", "source"),
+                              load_rate_gib_per_min())),
         "config_seen": bool(cfg["paths"]),
         "pending": pending["action"],
         "pending_model": pending["model"],

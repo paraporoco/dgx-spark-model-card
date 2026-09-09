@@ -52,8 +52,14 @@
   var timer = null, observer = null, logsOpen = false, busy = false;
   var lastStatus = null, notice = null;
 
-  // Observed cold-load rate on this box: 65.1 GiB in 7 min 24 s.
+  // Cold-load rate. The backend derives this from this host's own load_ready
+  // events (slow-end percentile, because the estimate is labelled "if not
+  // cached"); the constant is only the seed before enough loads have happened.
   var GIB_PER_MIN = 8.8;
+  function loadRate(st) {
+    var r = st && st.load_rate;
+    return (r && r.gib_per_min) ? r.gib_per_min : GIB_PER_MIN;
+  }
 
   var OK = "var(--text-color-feedback-success, #76b900)";
   var WARN = "var(--text-color-feedback-warning, #f5b800)";
@@ -115,9 +121,12 @@
     return Math.floor(s / 3600) + " h ago";
   }
 
-  function eta(gib) {
-    if (!gib || gib < 20) return null;
-    return "≈ " + Math.max(1, Math.round(gib / GIB_PER_MIN)) + " min if not cached";
+  function eta(gib, st) {
+    if (!gib || gib < 20) return null;   // matches NC_ETA_MIN_GIB
+    var rate = loadRate(st);
+    var measured = st && st.load_rate && st.load_rate.source === "measured";
+    return "≈ " + Math.max(1, Math.round(gib / rate)) + " min if not cached"
+           + (measured ? "" : " (estimated)");
   }
 
   // Tool-calling support is not visible anywhere else in the stack: a GGUF can
@@ -344,7 +353,7 @@
       plan = parts.join(" ");
       planColor = b.indexOf("headroom") !== -1 ? ERR : WARN;
     } else {
-      var e = eta(sel.size_gib);
+      var e = eta(sel.size_gib, st);
       plan = "Start will " +
              (sel.evicts && sel.evicts.length ? "unload " + sel.evicts.join(", ") + " and load " : "load ") +
              sel.name + " (" + sel.size_gib + " GiB" + (e ? ", " + e : "") + ").";
