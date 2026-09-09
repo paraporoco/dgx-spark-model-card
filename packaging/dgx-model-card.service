@@ -1,0 +1,43 @@
+[Unit]
+Description=DGX Spark model card - llama-swap control sidecar and load gate
+Documentation=https://github.com/mostlygeek/llama-swap
+After=network-online.target llama-swap.service
+Wants=llama-swap.service
+
+[Service]
+Type=simple
+User=REPLACE_ME
+Group=REPLACE_ME
+Environment=NC_HOST=127.0.0.1
+Environment=NC_PORT=8110
+Environment=NC_MODEL=nemotron-3-super-120b
+Environment=NC_SWAP_CONFIG=/etc/llama-swap/config.yaml
+Environment=NC_MARGIN_GIB=10
+Environment=NC_GATE=1
+Environment=NC_GATE_PORT=8111
+Environment=NC_SWAP_URL=http://127.0.0.1:8100
+Environment=NC_WEBROOT=/opt/local/dgx-model-card/web
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+StateDirectory=dgx-model-card
+ExecStart=/usr/bin/python3 /opt/local/dgx-model-card/model_card.py
+Restart=on-failure
+RestartSec=5
+
+# Hardening. The service needs only loopback HTTP and its own webroot.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
