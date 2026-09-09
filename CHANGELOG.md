@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.4.0 — 2026-09-09
+- **Real load progress.** llama-swap reports nothing between launching an upstream and its health check passing, so progress is read from the upstream `llama-server` process itself — GPU allocation where available, resident memory as the early fallback — against the GGUF's own size. Shown as a bar with `loaded / total GiB` and an ETA derived from the *observed* rate on this machine, not a baked-in constant. Verified live: 48.8 % at t+5 s, 99.9 % at t+10 s, ready at t+15 s.
+- **Tool-capability badge.** On first load of a model its chat template is fetched from `/props` and tested for `tools` / `tool_calls`, then cached in state. Models are badged `tools ✓` / `tools ✗` in the dropdown and beside the loaded model. This makes visible a failure that is otherwise silent: a GGUF can carry a template with no tool block and answer in prose instead of calling tools, even with `tool_choice="required"`.
+  - The badge is a **template check**, not a behavioural one, and the tooltip says so. A template can declare tools while the model still emits them malformed.
+
+
 ## 2.3.1 — 2026-09-09
 - **Name the client, don't just record it.** 2.3.0 captured the requesting `User-Agent` and never displayed it. The card now reads *"Last asked for by a client: qwen3-coder-next-80b · Continue (OpenAI JS SDK) · 41 s ago · triggered a load"*, with the raw User-Agent kept in the tooltip.
 - Labels derived from the User-Agents this stack actually produces — Continue.dev identifies as `OpenAI/JS`, since its OpenAI provider uses the JS SDK. Unknown agents degrade to their first path segment rather than being dropped.

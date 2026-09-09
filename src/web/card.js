@@ -1,4 +1,4 @@
-/* dgx-model-card v2.3.1 — "Local models" card for the NVIDIA DGX Dashboard.
+/* dgx-model-card v2.4 — "Local models" card for the NVIDIA DGX Dashboard.
  *
  * Touches no NVIDIA file. Mounts one node into the card grid; removed with
  * window.__dgxModelCard.destroy().
@@ -92,6 +92,21 @@
     return "≈ " + Math.max(1, Math.round(gib / GIB_PER_MIN)) + " min if not cached";
   }
 
+  // Tool-calling support is not visible anywhere else in the stack: a GGUF can
+  // carry a chat template with no tool block and then silently answer in prose
+  // rather than emitting tool_calls.
+  function toolsBadge(m) {
+    if (!m || m.tools === undefined || m.tools === null) return null;
+    return el("span", {
+      class: "nv-tag nv-tag--kind-outline nv-tag--color-" + (m.tools ? "green" : "red"),
+      title: "chat template " + (m.template_chars || "?") + " chars — " +
+             (m.tools ? "declares tools and tool_calls. Template check only: it does not "
+                      + "prove the model emits well-formed tool_calls at runtime."
+                      : "no tool block at all; this model answers in prose instead of "
+                      + "calling tools, even with tool_choice=required")
+    }, [m.tools ? "tools ✓" : "tools ✗"]);
+  }
+
   function dot(color, size) {
     return el("span", {
       class: "nv-status-indicator",
@@ -118,11 +133,29 @@
         res.map(function (r) {
           var m = (st.models || []).filter(function (x) { return x.id === r.id; })[0] || {};
           var starting = r.state === "starting";
+          var pct = (r.progress !== undefined && r.progress !== null)
+            ? Math.round(r.progress * 100) : null;
           return el("div", { style: "display:flex;align-items:flex-start;gap:10px;" }, [
             el("div", { style: "padding-top:5px;" }, [dot(starting ? WARN : OK)]),
-            el("div", { style: "display:flex;flex-direction:column;gap:2px;min-width:0;" }, [
-              el("span", { class: "nv-text nv-text--body-semibold-md" },
-                 [(m.name || r.id) + (starting ? "  — loading…" : "")]),
+            el("div", { style: "display:flex;flex-direction:column;gap:3px;min-width:0;flex:1 1 auto;" }, [
+              el("div", { style: "display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;" }, [
+                el("span", { class: "nv-text nv-text--body-semibold-md" },
+                   [(m.name || r.id) + (starting ? "  — loading…" : "")]),
+                toolsBadge(m)
+              ]),
+              // llama-swap reports nothing between launching an upstream and its
+              // health check passing, so this is read from the upstream process.
+              pct !== null ? el("div", { style: "display:flex;flex-direction:column;gap:2px;" }, [
+                el("div", { style: "height:6px;border-radius:999px;overflow:hidden;background:" + RAISED +
+                                   ";border:1px solid " + LINE + ";" }, [
+                  el("div", { style: "height:100%;width:" + pct + "%;background:" + WARN + ";" })
+                ]),
+                el("span", { class: LBL, style: DIM }, [
+                  pct + "%  ·  " + r.loaded_gib + " / " + r.size_gib + " GiB" +
+                  (r.eta_s ? "  ·  ~" + Math.max(1, Math.round(r.eta_s / 60)) + " min left" : "") +
+                  "  ·  from " + (r.progress_source === "gpu" ? "GPU allocation" : "resident memory")
+                ])
+              ]) : null,
               el("span", { class: LBL, style: "color:" + MUTED + ";" }, [
                 (m.size_gib ? m.size_gib + " GiB" : "") +
                 (m.group ? " · " + m.group : "") +
@@ -238,10 +271,11 @@
   function loadBlock(st, sel) {
     var options = (st.models || []).map(function (m) {
       var fit = m.can_load ? "fits" : (m.load_reason === "hold" ? "blocked" : "won't fit");
+      var tools = m.tools === true ? " · tools ✓" : (m.tools === false ? " · tools ✗" : "");
       return el("option", {
         value: m.id,
         selected: m.id === st.selected ? "selected" : null
-      }, [m.name + " — " + (m.size_gib || "?") + " GiB — " + fit]);
+      }, [m.name + " — " + (m.size_gib || "?") + " GiB" + tools + " — " + fit]);
     });
 
     var select = el("select", {

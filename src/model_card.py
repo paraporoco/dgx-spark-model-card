@@ -56,7 +56,7 @@ ALLOWED_ORIGINS = {
     "http://localhost:8110", "http://127.0.0.1:8110",
 }
 
-VERSION = "2.3.1"
+VERSION = "2.4.0"
 
 GATE_PORT = int(os.environ.get("NC_GATE_PORT", "8111"))
 GATE_ENABLED = os.environ.get("NC_GATE", "1") not in ("0", "false", "no")
@@ -72,7 +72,8 @@ STARTED_AT = time.time()
 
 _lock = threading.Lock()
 _pending = {"action": None, "model": None, "since": 0.0, "error": None}
-_state = {"selected": DEFAULT_MODEL, "hold": False, "margin_gib": DEFAULT_MARGIN_GIB}
+_state = {"selected": DEFAULT_MODEL, "hold": False, "margin_gib": DEFAULT_MARGIN_GIB,
+          "tools": {}}
 
 
 def load_state():
@@ -80,7 +81,7 @@ def load_state():
         with open(STATE_PATH) as fh:
             data = json.load(fh)
         with _lock:
-            for k in ("selected", "hold", "margin_gib"):
+            for k in ("selected", "hold", "margin_gib", "tools"):
                 if k in data:
                     _state[k] = data[k]
     except Exception:
@@ -252,6 +253,84 @@ def engine_state():
 GIB = 1073741824
 
 
+def upstream_procs():
+    """Map llama-swap's upstream llama-server processes to {model path: info}.
+
+    Read from /proc rather than asked of llama-swap, because llama-swap reports
+    nothing between launching an upstream and its health check passing - checked
+    across a week of journal, the only lines are the start and the pass.
+    """
+    out = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as fh:
+                argv = fh.read().split(b"\x00")
+            args = [a.decode("utf-8", "replace") for a in argv if a]
+            if not args or "llama-server" not in args[0]:
+                continue
+            path = port = None
+            for i, a in enumerate(args):
+                if a == "-m" and i + 1 < len(args):
+                    path = args[i + 1]
+                elif a == "--port" and i + 1 < len(args):
+                    port = args[i + 1]
+            if not path:
+                continue
+            rss = 0
+            with open("/proc/%s/statm" % pid) as fh:
+                rss = int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+            out[path] = {"pid": int(pid), "port": port, "rss": rss}
+        except Exception:
+            continue
+    return out
+
+
+# Progress samples per model, so the ETA comes from the observed rate on this
+# machine rather than a constant baked in from one measurement.
+_progress = {}
+
+
+def load_progress(model_id):
+    """(fraction, loaded_bytes, size_bytes, eta_seconds, source) or None."""
+    size = model_size_bytes(model_id)
+    path = parse_swap_config()["paths"].get(model_id)
+    if not size or not path:
+        return None
+    proc = upstream_procs().get(path)
+    if not proc:
+        return None
+
+    # Prefer the GPU allocation: on unified memory that is where the weights end
+    # up, and RSS falls away again once the load completes. RSS is the fallback
+    # for the early phase before any GPU allocation appears.
+    gpu = 0
+    for h in gpu_holders():
+        if h["pid"] == proc["pid"]:
+            gpu = h["bytes"]
+            break
+    loaded = max(gpu, proc["rss"])
+    source = "gpu" if gpu >= proc["rss"] else "rss"
+
+    now = time.time()
+    hist = _progress.setdefault(model_id, [])
+    hist.append((now, loaded))
+    while len(hist) > 40 or (hist and now - hist[0][0] > 180):
+        hist.pop(0)
+
+    eta = None
+    if len(hist) >= 2:
+        dt = hist[-1][0] - hist[0][0]
+        db = hist[-1][1] - hist[0][1]
+        if dt > 3 and db > 0:
+            eta = int(max(0, (size - loaded)) / (db / dt))
+            if eta > 7200:
+                eta = None
+
+    return (min(1.0, loaded / size), loaded, size, eta, source)
+
+
 _holders_cache = {"at": 0.0, "rows": []}
 
 
@@ -328,6 +407,40 @@ def mem_info():
         return {"total": vals["MemTotal"], "available": vals["MemAvailable"]}
     except Exception:
         return {"total": None, "available": None}
+
+
+def probe_tools(model_id, proxy):
+    """Does this model's chat template actually support tool calls?
+
+    Established the hard way: GGUFs pulled from an Ollama blob store can carry a
+    template with no tool block at all, and then silently answer in prose instead
+    of emitting tool_calls - even with tool_choice="required". Nemotron's template
+    is 10770 chars and contains both markers; Devstral's is 1590 and contains
+    neither. Nothing else in the stack surfaces this.
+    """
+    try:
+        req = urllib.request.Request(proxy.rstrip("/") + "/props", method="GET")
+        with urllib.request.urlopen(req, timeout=8) as r:
+            props = json.loads(r.read().decode("utf-8", "replace"))
+        tmpl = props.get("chat_template") or ""
+        if not tmpl:
+            return None
+        return {"tools": ("tools" in tmpl and "tool_calls" in tmpl),
+                "template_chars": len(tmpl)}
+    except Exception:
+        return None
+
+
+def remember_tools(model_id, verdict):
+    if not verdict:
+        return
+    st = get_state()
+    known = dict(st.get("tools") or {})
+    if known.get(model_id) != verdict:
+        known[model_id] = verdict
+        set_state(tools=known)
+        log_event("tools_probed", model=model_id, tools=verdict["tools"],
+                  template_chars=verdict["template_chars"])
 
 
 EVENTS_PATH = os.path.join(STATE_DIR.split(":")[0], "events.jsonl")
@@ -486,9 +599,14 @@ def _watch_resident():
                 was = prev.get(mid)
                 if stt == "ready" and was != "ready":
                     t0 = starts.pop(mid, None)
+                    _progress.pop(mid, None)
                     log_event("load_ready", model=mid,
                               duration_s=int(time.time() - t0) if t0 else None,
                               size_gib=round((model_size_bytes(mid) or 0) / GIB, 1))
+                    proxy = next((x.get("proxy") for x in r.get("running", [])
+                                  if x.get("model") == mid), None)
+                    if proxy:
+                        remember_tools(mid, probe_tools(mid, proxy))
             for mid in prev:
                 if mid not in cur:
                     log_event("unloaded", model=mid,
@@ -498,6 +616,20 @@ def _watch_resident():
 
 
 # ---------------------------------------------------------------- status
+
+def _progress_fields(model_id, state):
+    if state == "ready" or not model_id:
+        return {}
+    p = load_progress(model_id)
+    if not p:
+        return {}
+    frac, loaded, size, eta, source = p
+    return {"progress": round(frac, 3),
+            "loaded_gib": round(loaded / GIB, 1),
+            "size_gib": round(size / GIB, 1),
+            "eta_s": eta,
+            "progress_source": source}
+
 
 def build_status():
     reachable, models, running = engine_state()
@@ -510,6 +642,7 @@ def build_status():
     running_by_id = {r.get("model"): r for r in running}
     running_ids = list(running_by_id)
 
+    known_tools = get_state().get("tools") or {}
     entries = []
     for m in models:
         mid = m.get("id")
@@ -541,6 +674,8 @@ def build_status():
             "size_gib": round(size / GIB, 1) if size else None,
             "proxy": (run or {}).get("proxy"),
             "ttl": (run or {}).get("ttl"),
+            "tools": (known_tools.get(mid) or {}).get("tools"),
+            "template_chars": (known_tools.get(mid) or {}).get("template_chars"),
             "can_load": ok,
             "load_reason": reason,
             "load_detail": detail,
@@ -571,7 +706,8 @@ def build_status():
         "ttl": (sel or {}).get("ttl"),
         "models": entries,
         "resident": [
-            {"id": r.get("model"), "name": r.get("name"), "state": r.get("state")}
+            dict({"id": r.get("model"), "name": r.get("name"), "state": r.get("state")},
+                 **_progress_fields(r.get("model"), r.get("state")))
             for r in running
         ],
         "hold": st["hold"],
