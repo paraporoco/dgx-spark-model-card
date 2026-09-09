@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.9.0 — 2026-09-09
+
+- **A failed load can say why.** llama-swap v251 discards the upstream's
+  stderr — `/logs` carries proxy lines only, and `/logs/upstream`,
+  `/logs/upstream/<model>`, `/logs/proxy` and `/api/logs/upstream` are all 404
+  — so every start failure reads `upstream command exited prematurely` and
+  nothing else. Out of memory, a missing file and an unsupported projector are
+  indistinguishable, and the message sends you to the config when the machine
+  was the problem.
+- `packaging/llama-server-logged` tees llama-server's stderr per model. Point
+  the `${server}` macro at it; nothing else changes, and there is no runtime
+  cost.
+- `load_failed` events and the card's error line now carry the last upstream
+  error lines. `GET /api/upstream-log?model=<id>` returns the tail of the most
+  recent start.
+- Without the wrapper the tail is empty and nothing behaves differently.
+
 ## 2.5.0 — 2026-09-09
 - **Keep warm.** A per-model toggle that refreshes the model's TTL before it expires, and reloads it if it has been evicted — so the cost of a cold load is paid on a schedule instead of on your next prompt. At most one model at a time, because llama-swap's `large` group is exclusive and two warm large models would evict each other in a loop.
   - It obeys the same rules as everything else: **Blocked** stops a reload but not a ping (pinging a resident model allocates nothing), and the memory reserve applies to a reload exactly as to any other load. Verified live — blocked with `reason=hold` while loading was Blocked, then `keepwarm_reload` → ready once allowed.

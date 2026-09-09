@@ -189,6 +189,38 @@ CORS is allow-listed to the dashboard origins; a foreign origin gets no `Access-
 - systemd unit is hardened: `ProtectSystem=strict`, `ProtectHome=read-only`, `NoNewPrivileges`, `MemoryDenyWriteExecute`, empty `CapabilityBoundingSet`, `RestrictAddressFamilies=AF_INET AF_INET6`.
 - No credentials in this repo. If you put the gate behind a bearer proxy, the token lives in your proxy config, not here.
 
+## Seeing why a load failed
+
+llama-swap does not surface the upstream's stderr, so a failure looks like
+this and nothing more:
+
+```
+[WARN] group: starting qwen3-vl-4b failed: upstream command exited prematurely
+```
+
+Install the wrapper and point the macro at it:
+
+```bash
+sudo install -m 0755 packaging/llama-server-logged /opt/local/bin/
+sudo mkdir -p /var/log/llama-swap && sudo chown $USER /var/log/llama-swap
+```
+
+```yaml
+macros:
+  server: >
+    /opt/local/bin/llama-server-logged
+    --host 127.0.0.1 --port ${PORT}
+    --no-webui
+```
+
+The card then reports the real cause on a failed load, and
+`GET /api/upstream-log?model=<id>` returns the tail of the last start:
+
+```
+E llama_model_load_from_file_impl: failed to load model
+E srv  llama_server: exiting due to model loading error
+```
+
 ## Known limits
 
 - **Placement depends on the dashboard's DOM.** Developed against 0.29.2-2, where the card grid is `div.flex.gap-4.flex-wrap` and cards carry `data-testid="skele-panel"`. `findGrid()` tries three selectors, most specific first. A dashboard update can still move the card; it cannot break the dashboard. `packaging/99-dgx-model-card-apt-notice` prints a reminder to re-check when the package version changes.

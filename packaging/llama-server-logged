@@ -1,0 +1,51 @@
+#!/bin/bash
+# Tee llama-server's stderr to a per-model file, then exec it.
+#
+# llama-swap v251 discards the upstream process's stderr: /logs carries only
+# proxy lines, and /logs/upstream, /logs/upstream/<model>, /logs/proxy and
+# /api/logs/upstream are all 404. So every start failure reads
+#
+#     [WARN] group: starting <model> failed: upstream command exited prematurely
+#
+# and nothing else -- an out-of-memory condition is indistinguishable from a
+# bad path or an unsupported projector. Run the same command by hand and it
+# loads in seconds, which sends you looking at the config instead of the
+# memory.
+#
+# Point llama-swap's ${server} macro at this instead of llama-server:
+#
+#   macros:
+#     server: >
+#       /opt/local/bin/llama-server-logged
+#       --host 127.0.0.1 --port ${PORT}
+#       --no-webui
+#
+# The model id is taken from the -m path, because llama-swap does not export
+# one. Set LLAMA_BIN and LLAMA_LOG_DIR to override.
+set -u
+
+BIN="${LLAMA_BIN:-/opt/llama.cpp-build/build/bin/llama-server}"
+DIR="${LLAMA_LOG_DIR:-/var/log/llama-swap}"
+KEEP_BYTES="${LLAMA_LOG_KEEP:-1048576}"
+
+model="unknown"
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "-m" ] || [ "$prev" = "--model" ]; then
+        model=$(basename -- "$arg"); model="${model%.gguf}"
+        break
+    fi
+    prev="$arg"
+done
+
+if mkdir -p "$DIR" 2>/dev/null && [ -w "$DIR" ]; then
+    log="$DIR/${model}.err"
+    # Truncate rather than grow without bound: only the last failure matters.
+    if [ -f "$log" ] && [ "$(stat -c%s "$log" 2>/dev/null || echo 0)" -gt "$KEEP_BYTES" ]; then
+        tail -c "$KEEP_BYTES" "$log" > "$log.tmp" 2>/dev/null && mv "$log.tmp" "$log"
+    fi
+    printf '\n===== %s start %s =====\n' "$model" "$(date -Is)" >> "$log"
+    exec 2> >(tee -a "$log" >&2)
+fi
+
+exec "$BIN" "$@"
