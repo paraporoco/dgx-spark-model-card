@@ -21,13 +21,45 @@ for (const m of src.matchAll(/\bvar\s+([^;]+);/g)) {
 const globals = new Set(["URL", "JSON", "Math", "Date", "Object", "Array",
                          "Number", "String", "Promise", "NaN", "Infinity"]);
 
-// strip comments and string literals so prose and CSS do not look like code
-const code = src
-  .replace(/\/\*[\s\S]*?\*\//g, "")
-  .replace(/^\s*\/\/.*$/gm, "")
-  .replace(/"(?:[^"\\]|\\.)*"/g, '""')
-  .replace(/'(?:[^'\\]|\\.)*'/g, "''")
-  .replace(/`(?:[^`\\]|\\.)*`/g, "``");
+// Strip comments and string literals so prose and CSS do not look like code.
+//
+// This was four chained regexes and it only removed comments that started a
+// line, so a TRAILING `// ... NC_ETA_MIN_GIB` was read as code and reported
+// unresolved. A checker that cries wolf gets ignored, which costs more than
+// having no checker, so this is a real scanner instead.
+//
+// Known limit: a regex literal containing a quote or a `//` can still confuse
+// it. Neither appears in this codebase; if one ever does, the symptom is a
+// false positive here, never a missed identifier at runtime.
+function stripNonCode(text) {
+  let out = "", i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i], d = text[i + 1];
+    if (c === "/" && d === "/") {                   // line comment, anywhere
+      while (i < n && text[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && d === "*") {                   // block comment
+      i += 2;
+      while (i < n && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      i += 2;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {      // string literal
+      const q = c;
+      i++;
+      while (i < n && text[i] !== q) i += text[i] === "\\" ? 2 : 1;
+      i++;
+      out += q + q;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+const code = stripNonCode(src);
 
 const used = new Set();
 for (const m of code.matchAll(/(?<![.\w$])\b([A-Z][A-Z0-9_]{2,})\b/g)) used.add(m[1]);

@@ -1,4 +1,4 @@
-/* dgx-model-card v2.5 — "Local models" card for the NVIDIA DGX Dashboard.
+/* dgx-model-card v3.2 — "Local models" card for the NVIDIA DGX Dashboard.
  *
  * Touches no NVIDIA file. Mounts one node into the card grid; removed with
  * window.__dgxModelCard.destroy().
@@ -51,6 +51,69 @@
   var POLL_IDLE = 6000, POLL_BUSY = 2500;
   var timer = null, observer = null, logsOpen = false, busy = false;
   var lastStatus = null, notice = null;
+
+  // Log panes: keep the text and the scroll position across re-renders.
+  //
+  // The card re-mounts itself wholesale every poll (grid.replaceChild), so the
+  // two <pre> elements were brand new DOM every 2.5-6 s and loadLogs() then ran
+  // `p.scrollTop = p.scrollHeight` unconditionally. Reading anything but the
+  // last line was impossible: scroll up, wait two seconds, get yanked back.
+  //
+  // Three rules now:
+  //   * the text is cached here, so a re-rendered pane is born with its content
+  //     rather than with "loading..." -- no flash, and scrollHeight is real at
+  //     restore time
+  //   * scroll position is captured before the replace and restored after
+  //   * the pane sticks to the bottom ONLY if it was already at the bottom.
+  //     Scrolled up means reading; leave it alone.
+  var PANES = ["dgx-model-card-events", "dgx-model-card-logs"];
+  var paneText = {}, paneScroll = {}, skippedRenders = 0;
+  var MAX_SKIPPED = 20;            // ~1-2 min, so a stray selection cannot
+                                   // freeze the card indefinitely
+  var AT_BOTTOM_SLOP = 8;          // px; a few px of rounding still counts
+
+  function paneState(el3) {
+    if (!el3) return null;
+    return {
+      top: el3.scrollTop,
+      atBottom: (el3.scrollHeight - el3.scrollTop - el3.clientHeight) <= AT_BOTTOM_SLOP
+    };
+  }
+  function applyPaneState(el3, st2) {
+    if (!el3 || !st2) return;
+    el3.scrollTop = st2.atBottom ? el3.scrollHeight : st2.top;
+  }
+  function capturePanes() {
+    PANES.forEach(function (id) {
+      var el3 = document.getElementById(id);
+      if (el3) paneScroll[id] = paneState(el3);
+    });
+  }
+  function restorePanes() {
+    PANES.forEach(function (id) {
+      applyPaneState(document.getElementById(id), paneScroll[id]);
+    });
+  }
+  // Writing identical text still collapses the selection and can nudge scroll,
+  // so don't.
+  function setPane(id, text) {
+    paneText[id] = text;
+    var el3 = document.getElementById(id);
+    if (!el3 || el3.textContent === text) return;
+    var st2 = paneState(el3);
+    el3.textContent = text;
+    applyPaneState(el3, st2);
+  }
+  // A selection inside the card is someone copying a log line. Replacing the
+  // node under them destroys it.
+  function selectionInCard() {
+    var sel = window.getSelection && window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+    var card = document.getElementById(MOUNT_ID);
+    if (!card) return false;
+    var n = sel.getRangeAt(0).commonAncestorContainer;
+    return card.contains(n.nodeType === 1 ? n : n.parentNode);
+  }
 
   // Cold-load rate. The backend derives this from this host's own load_ready
   // events (slow-end percentile, because the estimate is labelled "if not
@@ -516,7 +579,7 @@
             id: "dgx-model-card-events",
             style: "margin:0;max-height:150px;overflow:auto;font-size:11px;line-height:1.5;background:" +
                    RAISED + ";padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-word;"
-          }, ["loading…"]),
+          }, [paneText["dgx-model-card-events"] || "loading…"]),
           heading("Engine log")
         ]) : null,
 
@@ -524,7 +587,7 @@
           id: "dgx-model-card-logs",
           style: "margin:0;max-height:180px;overflow:auto;font-size:11px;line-height:1.45;background:" +
                  RAISED + ";padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-all;opacity:.85;"
-        }, ["loading logs…"]) : null
+        }, [paneText["dgx-model-card-logs"] || "loading logs…"]) : null
       ]),
 
       el("div", { class: "nv-panel-footer",
@@ -572,10 +635,18 @@
     if (cur && cur.parentElement === grid) {
       if (document.activeElement && cur.contains(document.activeElement) &&
           document.activeElement.tagName === "SELECT") return true;
+      if (selectionInCard() && skippedRenders < MAX_SKIPPED) {
+        skippedRenders++;
+        return true;                 // leave the DOM alone; setPane still runs
+      }
+      skippedRenders = 0;
+      capturePanes();
       grid.replaceChild(node, cur);
+      restorePanes();
     } else {
       if (cur && cur.parentElement) cur.parentElement.removeChild(cur);
       grid.appendChild(node);
+      restorePanes();
     }
     return true;
   }
@@ -583,14 +654,13 @@
   function loadLogs() {
     api("/api/logs?n=120").then(function (r) {
       var p = document.getElementById("dgx-model-card-logs");
-      if (p) { p.textContent = (r.body.lines || []).join("\n") || "(empty)"; p.scrollTop = p.scrollHeight; }
+      if (p || true) setPane("dgx-model-card-logs",
+                             (r.body.lines || []).join("\n") || "(empty)");
     }).catch(function () {});
     api("/api/events?n=12").then(function (r) {
-      var p = document.getElementById("dgx-model-card-events");
-      if (!p) return;
       var ev = (r.body.events || []).slice().reverse();
-      if (!ev.length) { p.textContent = "(no activity recorded yet)"; return; }
-      p.textContent = ev.map(function (e) {
+      if (!ev.length) { setPane("dgx-model-card-events", "(no activity recorded yet)"); return; }
+      setPane("dgx-model-card-events", ev.map(function (e) {
         var t = new Date(e.ts * 1000).toLocaleTimeString();
         var bits = [];
         if (e.model) bits.push(e.model);
@@ -600,7 +670,7 @@
         if (e.enabled !== undefined) bits.push(e.enabled ? "on" : "off");
         if (e.replaced_by) bits.push("replaced by " + e.replaced_by);
         return t + "  " + e.kind + (bits.length ? "  " + bits.join(" · ") : "");
-      }).join("\n");
+      }).join("\n"));
     }).catch(function () {});
   }
 

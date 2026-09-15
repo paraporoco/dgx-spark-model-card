@@ -57,7 +57,7 @@ ALLOWED_ORIGINS = {
     "http://localhost:8110", "http://127.0.0.1:8110",
 }
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 GATE_PORT = int(os.environ.get("NC_GATE_PORT", "8111"))
 GATE_ENABLED = os.environ.get("NC_GATE", "1") not in ("0", "false", "no")
