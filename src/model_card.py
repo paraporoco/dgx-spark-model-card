@@ -57,7 +57,7 @@ ALLOWED_ORIGINS = {
     "http://localhost:8110", "http://127.0.0.1:8110",
 }
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 
 GATE_PORT = int(os.environ.get("NC_GATE_PORT", "8111"))
 GATE_ENABLED = os.environ.get("NC_GATE", "1") not in ("0", "false", "no")
@@ -262,7 +262,9 @@ def gguf_header(path):
     if hit and hit[0] == mtime:
         return hit[1]
     want = ("block_count", "head_count", "head_count_kv",
-            "key_length", "value_length", "embedding_length")
+            "key_length", "value_length", "embedding_length",
+            "full_attention_interval", "nextn_predict_layers",
+            "recurrent_layers")
     out = {}
     try:
         with open(path, "rb") as fh:
@@ -305,6 +307,47 @@ def gguf_header(path):
     return out
 
 
+def attn_layers(h, blocks):
+    """How many layers actually hold a KV cache. Not always block_count.
+
+    Three shapes seen in the wild, checked in the same order llama.cpp checks
+    them:
+
+      * an explicit per-layer recurrence map (attention.recurrent_layers)
+      * a hybrid that publishes a SCALAR head_count_kv and expresses the
+        pattern in full_attention_interval -- qwen35, i.e. Qwen3.5 and
+        Qwen3.8. Only every Nth layer holds KV
+      * a plain dense model, where every block holds KV
+
+    The middle case is why this function exists. Measured on Qwen3.8-27B:
+    block_count 65, full_attention_interval 4, and exactly 17 tensors named
+    blk.*.attn_k.weight -- 16 trunk layers plus the MTP layer, against 48
+    carrying blk.*.ssm_conv1d.weight. Charging all 65 blocks overestimates the
+    cache 4.3x, which would refuse loads that fit comfortably.
+
+    Note the other hybrid shape is already handled by the caller: Nemotron-H
+    and Qwen3-Next publish head_count_kv as a per-block ARRAY with 0 for their
+    linear layers, and summing it gives the right answer directly.
+
+    llama.cpp's rule, src/models/qwen35.cpp:
+        is_recurrent[i] = (i < n_layer_trunk) && ((i + 1) % interval != 0)
+    """
+    recr = h.get("attention.recurrent_layers")
+    if isinstance(recr, list) and len(recr) == blocks:
+        return max(1, sum(1 for r in recr if not r))
+
+    interval = h.get("full_attention_interval")
+    if not isinstance(interval, int) or interval < 1:
+        return blocks
+
+    # MTP layers are dense attention-only, so they hold KV as well -- and when
+    # MTP is not loaded, counting one extra of seventeen errs by 6% upward,
+    # which is the safe direction for a guard.
+    nextn = h.get("nextn_predict_layers") or 0
+    trunk = max(1, blocks - nextn)
+    return max(1, trunk // interval + nextn)
+
+
 def kv_cache_bytes(model_id):
     """Estimated KV cache for this model at its configured context.
 
@@ -313,6 +356,10 @@ def kv_cache_bytes(model_id):
     keeps the estimate from charging attention memory for layers that have
     none -- treating block_count as the layer count overestimates those models
     several-fold.
+
+    Hybrids that publish a SCALAR head_count_kv instead -- qwen35 (Qwen3.5,
+    Qwen3.8) -- hide the same structure in full_attention_interval, so the
+    layer count comes from attn_layers() rather than from block_count.
 
     Assumes one unified cache of n_ctx (what llama-server reports as
     kv_unified) and f16 elements unless -ctk says otherwise. Returns 0 rather
@@ -330,7 +377,8 @@ def kv_cache_bytes(model_id):
     blocks = h.get("block_count")
     if kvh is None or not blocks:
         return 0
-    total_kv_heads = sum(kvh) if isinstance(kvh, list) else kvh * blocks
+    total_kv_heads = (sum(kvh) if isinstance(kvh, list)
+                      else kvh * attn_layers(h, blocks))
 
     k_dim = h.get("attention.key_length")
     v_dim = h.get("attention.value_length")
