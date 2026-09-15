@@ -57,7 +57,7 @@ ALLOWED_ORIGINS = {
     "http://localhost:8110", "http://127.0.0.1:8110",
 }
 
-VERSION = "3.0.1"
+VERSION = "3.1.0"
 
 GATE_PORT = int(os.environ.get("NC_GATE_PORT", "8111"))
 GATE_ENABLED = os.environ.get("NC_GATE", "1") not in ("0", "false", "no")
@@ -881,18 +881,45 @@ def _unload_worker():
 def _keep_warm():
     """Refresh a model's TTL before it expires, and bring it back if it is gone.
 
-    Two rules it must not break:
+    Three rules it must not break:
       * Hold means no NEW loads. Pinging a model that is already resident
         allocates nothing, so that continues; reloading an evicted one does not.
       * The headroom guard applies to a reload exactly as it does to any other
         load. Keep-warm must never be the thing that OOMs the box.
+      * It must never fight another client for an exclusive slot. Reloading a
+        model that someone else just evicted does not keep anything warm -- it
+        evicts THEM, they reload, and the two take turns starting multi-minute
+        loads that neither ever finishes.
+
+    That third rule is not hypothetical. Observed 2026-09-15, keep-warm set to
+    qwen3-coder-next-80b while Continue kept requesting nemotron-3-super-120b:
+
+        16:55:34 keepwarm_reload  load_start 48.2 GiB
+        16:55:39 unloaded         qwen3-coder-next-80b     <- evicted
+        16:55:53 load_requested   nemotron-3-super-120b (Continue)
+        16:55:54 keepwarm_reload  load_start 48.2 GiB
+        16:56:14 keepwarm_reload  load_start 48.2 GiB
+        16:56:34 keepwarm_reload  load_start 48.2 GiB
+
+    every 20 s, restarting a five-minute load that never completed. Two bugs:
+    no minimum gap between reload attempts, and no notion of losing the slot to
+    somebody else.
     """
+    RELOAD_MIN_GAP = 120          # never start reloads closer together than this
+    YIELD_BACKOFF  = (60, 180, 420)
+    YIELD_GIVE_UP  = len(YIELD_BACKOFF)
+
     last_ping = {}
+    next_try  = {}                # model -> earliest time a reload may start
+    yields    = {}                # model -> consecutive losses of the slot
+
     while True:
         time.sleep(20)
         try:
             target = get_state().get("warm")
             if not target:
+                next_try.clear()
+                yields.clear()
                 continue
             try:
                 _, r = swap_json("/running", timeout=6)
@@ -902,6 +929,9 @@ def _keep_warm():
 
             entry = running.get(target)
             if entry and (entry.get("state") == "ready"):
+                # Warm and serving: forget any contention history.
+                next_try.pop(target, None)
+                yields.pop(target, None)
                 ttl = entry.get("ttl") or 0
                 if ttl <= 0:
                     continue                      # no expiry to defend against
@@ -919,19 +949,48 @@ def _keep_warm():
             if entry:
                 continue                          # mid-load; leave it alone
 
-            # Not resident. Reload only if the same rules that govern any other
-            # load allow it.
+            now = time.time()
+            if now < next_try.get(target, 0):
+                continue                          # backing off
+
+            # Has another client taken the exclusive slot? Then this is not a
+            # model that idled out, it is a model that lost a fight, and
+            # reloading it restarts the fight.
+            grp = group_of(target)
+            if grp and is_exclusive(grp):
+                members = set(parse_swap_config()["groups"].get(grp, []))
+                intruder = next((m for m in running if m != target and m in members), None)
+                if intruder:
+                    n = yields.get(target, 0) + 1
+                    yields[target] = n
+                    if n >= YIELD_GIVE_UP:
+                        set_state(warm=None)
+                        next_try.pop(target, None)
+                        yields.pop(target, None)
+                        log_event("keepwarm_gave_up", model=target, to=intruder,
+                                  after=n,
+                                  detail="another client keeps taking the %s slot" % grp)
+                    else:
+                        wait = YIELD_BACKOFF[n - 1]
+                        next_try[target] = now + wait
+                        log_event("keepwarm_yielded", model=target, to=intruder,
+                                  attempt=n, retry_in_s=wait)
+                    continue
+
+            # Genuinely absent. Reload only if the same rules that govern any
+            # other load allow it.
             ok, reason, detail = evaluate_load(target, list(running))
             if not ok:
-                if time.time() - last_ping.get("_blocked:" + target, 0) > 600:
-                    last_ping["_blocked:" + target] = time.time()
+                if now - last_ping.get("_blocked:" + target, 0) > 600:
+                    last_ping["_blocked:" + target] = now
                     log_event("keepwarm_blocked", model=target, reason=reason,
                               detail=detail or None)
                 continue
             log_event("keepwarm_reload", model=target)
+            next_try[target] = now + RELOAD_MIN_GAP
             _set_pending("start", target)
             threading.Thread(target=_load_worker, args=(target,), daemon=True).start()
-            last_ping[target] = time.time()
+            last_ping[target] = now
         except Exception as e:  # noqa: BLE001
             print("keep-warm loop error: %s" % e, flush=True)
 
